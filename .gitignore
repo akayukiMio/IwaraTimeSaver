@@ -1,0 +1,17 @@
+﻿# 凭据与状态（绝不入库）
+config.local.json
+state/
+logs/
+
+# 下载产物（用户资产）
+E:/administrator/iwara-out/
+
+# 系统文件
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# 临时文件
+*.tmp
+*.part
+*.prog

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iwaraMachine · 点赞与 Source 下载面板</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='9' fill='%23e0559a'/><path d='M16 24V9m0 0-5 5m5-5 5 5' stroke='white' stroke-width='2.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="theme.css">
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand">
+      <span class="mark">▶</span>
+      <div><h1>iwaraMachine</h1><p>点赞 · Source 下载 · 分段并发</p></div>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="top-actions">
+      <button class="btn" id="btnStart">继续队列</button>
+      <button class="btn danger" id="btnStop">停止全部</button>
+      <button class="ghost" id="btnRelogin">重新登录</button>
+      <button class="ghost" id="btnOut">输出目录</button>
+      <button class="ghost" id="btnTheme">深色/浅色</button>
+    </div>
+  </header>
+
+  <section class="adder">
+    <div class="adder-main">
+      <label for="links">粘贴 iwara 视频链接（一行一个，或空格分隔；也可以只写视频 ID）</label>
+      <textarea id="links" rows="3" placeholder="https://www.iwara.tv/video/xxxxxxxx/xxxx&#10;https://www.iwara.tv/video/yyyyyyyy"></textarea>
+    </div>
+    <div class="adder-side">
+      <button class="btn primary big" id="btnEnqueue">加入队列并开始</button>
+      <p class="tip">每个视频会先<b>点赞</b>（已赞过的自动跳过，不会点成取消），再按 <span id="segTip">8</span> 段并发下载 <b>Source</b> 原片。</p>
+    </div>
+  </section>
+
+  <section class="board">
+    <div class="board-head">
+      <h2>任务队列</h2>
+      <div class="overall">
+        <div class="overall-bar"><i id="ovBar"></i></div>
+        <span id="ovText">—</span>
+      </div>
+      <button class="ghost" id="btnRetryFailed">重试失败项</button>
+      <button class="ghost" id="btnClearDone">清除已完成</button>
+    </div>
+    <div id="list" class="list"><div class="empty">队列是空的，把链接粘到上面开始。</div></div>
+  </section>
+
+  <section class="dock collapsed" id="dock">
+    <div class="dock-bar">
+      <button class="dock-toggle" id="dockToggle">▤</button>
+      <strong>运行日志</strong>
+      <select id="logFilter" class="mini"><option value="">全部任务</option></select>
+      <span class="grow"></span>
+      <button class="ghost" id="logClear">清空</button>
+    </div>
+    <div class="dock-body"><pre class="log" id="log"><span class="ph">日志会实时出现在这里（服务端 60ms 攒批下发）。</span></pre></div>
+  </section>
+</div>
+<div class="toasts" id="toasts"></div>
+<script src="app.js" type="module"></script>
+</body>
+</html>

@@ -1,0 +1,12 @@
+﻿{
+  "email": "你的 iwara 邮箱",
+  "password": "你的 iwara 密码",
+  "outDir": "E:\\administrator\\iwara-out",
+  "quality": "Source",
+  "maxTasks": 2,
+  "segmentsPerFile": 8,
+  "segmentStallSec": 20,
+  "webPort": 8811,
+  "cdpPort": 9333,
+  "likeBeforeDownload": true
+}
