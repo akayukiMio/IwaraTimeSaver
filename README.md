@@ -16,8 +16,8 @@ iwara 视频批量下载工具：自动点赞 → 解析 Source 原片 → 分�
 
 1. 克隆仓库
 2. 复制 `config.local.json.example` → `config.local.json`，填入 iwara 账号密码
-3. 双击 `start.cmd`
-4. 浏览器打开 `http://127.0.0.1:8811/`，粘贴视频链接 → 加入队列
+3. 双击 `start.vbs`（无窗口后台启动）或 `start.cmd`（调试模式，会出命令行窗口）
+4. 浏览器自动打开 `http://127.0.0.1:8811/`，粘贴视频链接 → 加入队列
 
 ## 技术栈
 
@@ -29,7 +29,8 @@ iwara 视频批量下载工具：自动点赞 → 解析 Source 原片 → 分�
 
 ```
 IwaraTimeSaver/
-├─ start.cmd              双击入口
+├─ start.vbs              ★双击入口（无窗口后台启动）
+├─ start.cmd              调试入口（会出命令行窗口）
 ├─ config.local.json      参数与凭据（不入库）
 ├─ server/                面板服务
 ├─ engine/                下载引擎（browser.mjs + task.ps1 + segment.ps1）
@@ -41,7 +42,7 @@ IwaraTimeSaver/
 
 - API 的 `file.size` 可能比 CDN 实际字节大，下载器以 CDN 的 `Content-Range` 为准
 - 点赞有切换语义，已赞视频会自动跳过
-- 输出目录：`E:\administrator\iwara-out\`
+- 输出目录：`E:\administrator\iwara-out\`（视频直接存放根目录，不按作者分文件夹）
 
 ## License
 

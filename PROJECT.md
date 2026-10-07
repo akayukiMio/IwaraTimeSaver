@@ -23,7 +23,8 @@
 
 ```
 IwaraTimeSaver/
-├─ start.cmd                    ★双击入口（起面板 + 开浏览器）
+├─ start.vbs                    ★双击入口（无窗口后台启动）
+├─ start.cmd                    调试入口（会出命令行窗口）
 ├─ config.local.json            ★参数与凭据（不入库）
 ├─ .gitignore                   防手滑
 ├─ server/
@@ -48,8 +49,8 @@ IwaraTimeSaver/
 ## 3. 标准工作流
 
 ```powershell
-# 日常：双击 start.cmd，浏览器里粘贴链接 → 加入队列并开始
-# 命令行等价：
+# 日常：双击 start.vbs（无窗口后台启动），浏览器里粘贴链接 → 加入队列并开始
+# 调试：双击 start.cmd（会出命令行窗口）
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8811/api/enqueue `
   -ContentType 'application/json' -Body '{"links":["https://www.iwara.tv/video/<id>/x"]}'
 Invoke-RestMethod http://127.0.0.1:8811/api/state        # 看队列与进度
@@ -86,7 +87,7 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 
 ## 5. 命名与数据约定
 
-产物：`<outDir>\<作者>\<标题>[<视频ID>].mp4`；标题里的 `\ / : * ? " < > |` 换成 `_`，超 120 字截断。
+产物：`<outDir>\<标题>[<视频ID>].mp4`；标题里的 `\ / : * ? " < > |` 换成 `_`，超 120 字截断。视频直接存放 outDir 根目录，不按作者分文件夹。
 状态取值：`queued → resolving → downloading → done | failed | stopped`。
 
 ## 6. 必须知道的坑（都是实测踩过的）
@@ -134,7 +135,7 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 - 任务栏隐藏已验证：Edge 窗口启动后自动从任务栏摘掉（`hide 3 window(s)`）
 - 进度条修复：`pollProgress()` 对 `status === 'done'` 的任务也回读 `total`，CDN 实到写回后进度条到 100%
 - `config.local.json` 的全部字段均已接线；面板日志落盘 `logs\panel.log` 已验证
-- 桌面快捷方式：`start.cmd` + `iwaraMachine.ico`（多尺寸标准 ICO）
+- 桌面快捷方式：`start.vbs`（无窗口后台启动）+ `iwaraMachine.ico`（多尺寸标准 ICO）
 
 ## 10. 版本管理与对外边界
 
