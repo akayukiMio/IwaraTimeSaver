@@ -246,7 +246,7 @@ async function resolveTask(t) {
   if (!src?.src?.download) throw new Error('没有可用的 download 直链');
   t.url = decodeURIComponent(`https:${src.src.download}`);
   t.quality = src.name;
-  const dir = path.join(CFG.outDir, safeName(t.author));
+  const dir = CFG.outDir;
   fs.mkdirSync(dir, { recursive: true });
   t.outFile = path.join(dir, `${safeName(t.title)}[${t.id}]${extOf(v.file?.name, src.mime)}`);
   t.expires = (() => { const m = /[?&]expires=(\d+)/.exec(t.url); return m ? Number(m[1]) : 0; })();
