@@ -1,15 +1,21 @@
 ﻿# =============================================================================
 #  segment.ps1 —— 下载一个字节区间 [From,To] 到 .part 文件（可反复重启续传）
 #
-#  退出码约定（task.ps1 依赖它做决策，别改）：
-#    0 完成   1 重试耗尽   3 直链失效(403/410，需要重新签名)   4 服务端不支持 Range
+#  退出码约定（task.ps1 / server.mjs 依赖它做决策，别改）：
+#    0 完成
+#    1 重试耗尽（网络类，可重来）
+#    3 直链失效(401/403，需要重新签名)
+#    4 服务端不支持 Range（分段下载不可用）
+#    6 资源不存在(404/410)：重试无意义，视频文件在 CDN 上已经没了
 #
-#  ⚠️ 实测坑：API 的 file.size 可能比 CDN 实际字节数**大**（本次 288318914 vs 288302958，
-#     差 15956 字节）。以 API 大小为准会让最后一段永远凑不满 → 无限重试、卡住合并。
-#     所以本段是否"完成"一律以 CDN 给的 Content-Range 总量为准；提前到 EOF 也算完成。
-#
-#  看门狗做法：把 ReadWriteTimeout 当成"零字节多久算卡死"。.NET 在超时后让 Read 抛异常，
-#  我们关掉请求、从当前已落盘长度重新发 Range —— 这就是浏览器做不到、需要手点"继续"的那件事。
+#  ⚠️ 实测坑 1：API 的 file.size 可能比 CDN 实际字节数**大**（288318914 vs 288302958，
+#     也见过差 27%）。以 API 大小为准会让最后一段永远凑不满 → 无限重试、卡住合并。
+#     完成判定一律以 CDN 的 Content-Range 总量为准；提前到 EOF 也算完成。
+#  ⚠️ 实测坑 2：HttpWebResponse **没有** ContentRange 属性（老代码 `$resp.ContentRange`
+#     恒为 $null → serverTotal 永远是 -1，上面那条规则其实从没生效过）。必须自己解析
+#     Headers['Content-Range']。
+#  ⚠️ 实测坑 3：404 曾被当成“可重试”，于是 8 段各重试 50 次、task.ps1 再无限重启，
+#     一个已删源的视频能耗满 12 小时。404/410 必须立刻终止。
 # =============================================================================
 param(
     [Parameter(Mandatory = $true)][string]$Url,
@@ -17,7 +23,8 @@ param(
     [Parameter(Mandatory = $true)][long]$From,
     [Parameter(Mandatory = $true)][long]$To,
     [int]$StallSec = 20,
-    [int]$MaxTries = 50
+    [int]$MaxTries = 50,
+    [string]$LogFile = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,10 +37,17 @@ $tries = 0
 $startedAt = Get-Date
 $serverTotal = -1                                          # CDN 报的真实总长
 
-function Write-Prog([long]$done, [double]$speed, [bool]$complete) {
+function Say([string]$Text) {
+    $line = ('[{0}] seg[{1}] {2}' -f (Now-Utc), $From, $Text)
+    Write-Host $line
+    if ($LogFile) { Append-Log $LogFile $line }
+}
+
+function Write-Prog([long]$Done, [double]$Speed, [bool]$Complete, [string]$Note) {
     Write-JsonFile $progPath ([ordered]@{
-        done = $done; from = $From; to = $To; speed = [Math]::Round($speed, 2)
-        tries = $tries; complete = $complete; serverTotal = $serverTotal; at = (Now-Utc)
+        done = $Done; from = $From; to = $To; speed = [Math]::Round($Speed, 2)
+        tries = $tries; complete = $Complete; serverTotal = $serverTotal
+        lastError = $Note; pid = $PID; at = (Now-Utc)
     })
 }
 
@@ -42,6 +56,7 @@ while ($true) {
     $done = 0
     if ([System.IO.File]::Exists($Part)) { $done = (New-Object System.IO.FileInfo $Part).Length }
     $fs = $null
+    $resp = $null
     try {
         $req = [System.Net.HttpWebRequest]::Create($Url)
         $req.Method = 'GET'
@@ -59,24 +74,48 @@ while ($true) {
             if (-not $resp) { throw }
         }
         $code = [int]$resp.StatusCode
+
+        # ---- 终止类状态：不要重试，立刻带码退给 task.ps1 ----
         if ($code -eq 416) {
-            # HTTP 416: 请求范围超出 CDN 实际字节数
-            # 这说明 API 声称的 size 比 CDN 给的实际多，本段 From 起点已经超过了真实文件尾
-            # → 这段不用下，标记为完成（done=0, complete=true）
-            $resp.Close(); Write-Prog $done 0 $true; exit 0
+            # 请求范围超出 CDN 实际字节数：API size 比实到大，本段已到实尾
+            $resp.Close(); Say 'HTTP 416，本段已到 CDN 实尾'
+            Write-Prog $done 0 $true 'HTTP 416 范围已满足'
+            exit 0
         }
-        if ($code -eq 403 -or $code -eq 410) { 
-            $resp.Close(); 
-            Write-Prog $done 0 $false; 
-            exit 3 
+        if ($code -eq 404 -or $code -eq 410) {
+            $resp.Close()
+            Say ("HTTP {0} 资源不存在：该视频在 CDN 上已无文件（Source/转码可能已被删除）" -f $code)
+            Write-Prog $done 0 $false ("HTTP {0} 资源不存在" -f $code)
+            exit 6
         }
-        if ($resp.ContentRange -gt 0) { $serverTotal = [long]$resp.ContentRange }
+        if ($code -eq 401 -or $code -eq 403) {
+            $resp.Close()
+            Say ("HTTP {0} 直链失效，交回上层重新签名" -f $code)
+            Write-Prog $done 0 $false ("HTTP {0} 直链失效" -f $code)
+            exit 3
+        }
+        if ($code -eq 429 -or $code -ge 500) {
+            $resp.Close()
+            Say ("HTTP {0} 服务端临时错误，退避后重试" -f $code)
+            Write-Prog $done 0 $false ("HTTP {0} 服务端临时错误" -f $code)
+            Start-Sleep -Seconds ([Math]::Min(30, 3 + $tries))
+            continue
+        }
+
+        # ---- 真实总长：必须自己解析响应头（HttpWebResponse 没有 ContentRange 属性）----
+        $cr = $resp.Headers['Content-Range']
+        if ($cr) {
+            $m = [regex]::Match([string]$cr, '/(\d+)\s*$')
+            if ($m.Success) { $serverTotal = [long]$m.Groups[1].Value }
+        } elseif ($code -eq 200 -and $resp.ContentLength -ge 0) {
+            $serverTotal = [long]$resp.ContentLength
+        }
 
         if ($want -gt 0 -and $code -eq 200) {
-            # 要了 Range 却给 200 = 不支持分段；只有第 0 段能这么用
+            # 要了 Range 却给 200 = 不支持分段；单段整取会把 8 段全下成同一个文件，必须拒绝
             $resp.Close()
-            if ($From -eq 0) { Write-Prog $done 0 $false; exit 0 }
-            Write-Prog $done 0 $false
+            Say 'CDN 不支持 Range（返回 200），分段下载不可用'
+            Write-Prog $done 0 $false 'HTTP 200 不支持 Range'
             exit 4
         }
 
@@ -92,28 +131,31 @@ while ($true) {
             if (((Get-Date) - $lastBeat).TotalMilliseconds -ge 800) {
                 $fs.Flush($true)
                 $secs = ((Get-Date) - $lastBeat).TotalSeconds
-                Write-Prog $done $(if ($secs -gt 0) { ($done - $lastDone) / 1MB / $secs } else { 0 }) $false
+                Write-Prog $done $(if ($secs -gt 0) { ($done - $lastDone) / 1MB / $secs } else { 0 }) $false ''
                 $lastBeat = Get-Date; $lastDone = $done
             }
             if ($want -gt 0 -and $done -ge $want) { break }
         }
         $fs.Flush($true); $fs.Close(); $st.Close(); $resp.Close()
-        $fs = $null
+        $fs = $null; $resp = $null
 
-        if ($want -gt 0 -and $done -ge $want) { Write-Prog $done 0 $true; exit 0 }
-        # CDN 真实总长比 API 声称的小：本段读到 EOF 就是读完了
+        if ($want -gt 0 -and $done -ge $want) { Write-Prog $done 0 $true ''; exit 0 }
+        # CDN 真实总长比 API 声称的小：读到 EOF 就是读完了（现在这条真的会生效）
         if ($eof -and $serverTotal -gt 0 -and ($From + $done) -ge $serverTotal) {
-            Write-Host ("[{0}] seg{1} CDN 实际总长 {2} < 预期 {3}，本段按完成处理" -f (Now-Utc), $From, $serverTotal, ($To + 1))
-            Write-Prog $done 0 $true; exit 0
+            Say ("CDN 实际总长 {0} < 预期 {1}，本段按完成处理" -f $serverTotal, ($To + 1))
+            Write-Prog $done 0 $true ''
+            exit 0
         }
-        if ($want -lt 0 -and $done -gt 0) { Write-Prog $done 0 $true; exit 0 }
+        if ($want -lt 0 -and $eof -and $done -gt 0) { Write-Prog $done 0 $true ''; exit 0 }
         throw "流提前结束（done=$done want=$want eof=$eof serverTotal=$serverTotal）"
     } catch {
         try { if ($fs) { $fs.Close() } } catch { }
-        Write-Host ("[{0}] seg{1} 第 {2} 次中断：{3}" -f (Now-Utc), $From, $tries, $_.Exception.Message)
-        Write-Prog $done 0 $false
-        if ($tries -ge $MaxTries) { exit 1 }
-        if ((Get-Date) - $startedAt -gt (New-TimeSpan -Hours 6)) { exit 1 }
+        try { if ($resp) { $resp.Close() } } catch { }
+        $msg = $_.Exception.Message
+        Say ("第 {0} 次中断：{1}" -f $tries, $msg)
+        Write-Prog $done 0 $false $msg
+        if ($tries -ge $MaxTries) { Say ("重试耗尽（{0} 次），放弃本段" -f $MaxTries); exit 1 }
+        if (((Get-Date) - $startedAt) -gt (New-TimeSpan -Hours 6)) { Say '超过 6 小时，放弃本段'; exit 1 }
         Start-Sleep -Seconds ([Math]::Min(15, 2 + $tries % 10))
     }
 }

@@ -56,12 +56,13 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8811/api/enqueue `
 Invoke-RestMethod http://127.0.0.1:8811/api/state        # 看队列与进度
 Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进度保留，可续）
 ```
-首次启动会在第一个任务时拉起一个**离屏 Edge 窗口**（`--window-position=-32000,-32000`）用于过 Cloudflare，之后一直复用；那个窗口不要手动关，关了会自动重开。
+首次启动会在第一个任务时拉起一个**离屏 Edge 窗口**（`--window-position=-32000,-32000`）用于过 Cloudflare，之后一直复用；那个窗口不要手动关，关了会自动重开。面板启动会自动预热登录（`warmBrowserOnStart`），并优先复用 `state/tokens.json` 里的令牌——正常情况下打开面板就是“已登录”，不需要再点「重新登录」。
 
 ## 4. 模块职责与关键参数
 
 ### `config.local.json`
 `email` `password` `apiBase` `outDir` `quality`(Source) `maxTasks`(文件级并发) `segmentsPerFile`(段数) `segmentStallSec`(卡死阈值) `webPort` `cdpPort` `likeBeforeDownload`
+`warmBrowserOnStart`(启动预热登录，默认 true) `formLoginFallback`(表单登录回退，默认 false) `staleProgressSec`(进度多久没更新算僵死，默认 180) `logMaxMb`(单日志上限，默认 8)
 
 ### `engine/browser.mjs`
 - `Browser.start({profileDir,port})`：找不到可调试实例就起一个；等 CDP 端口就绪；导航到 iwara 并轮询标题直到过 CF
@@ -81,7 +82,10 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 
 ### `engine/task.ps1` / `engine/segment.ps1`
 - 段边界只由 `(size, 段数)` 决定 → 重跑即续传；每段独立 `.part` + `.part.prog`
-- `segment.ps1` 退出码：`0 完成 / 1 重试耗尽 / 3 直链失效 / 4 不支持 Range`
+- `segment.ps1` 退出码：`0 完成 / 1 重试耗尽 / 3 直链失效 / 4 不支持 Range / 6 资源不存在(404/410)`
+- `task.ps1` 退出码：`0 完成 / 2 失败 / 3 需重签 / 5 停止 / 6 资源不存在 / 7 反复停滞 / 9 锁冲突`
+- 单实例锁：`state/tasks/<id>.json.lock` 存 task.ps1 的 pid；同一任务第二个实例直接 exit 9
+- 段日志：`logs/seg/<id>.seg<n>.log`（失败保留、成功删除），404/超时原因写进 `.prog` 的 `lastError`
 - 完成判定以 **CDN 的 `Content-Range` 总量**为准（见 §6 坑 2），`.prog.complete` 是 task.ps1 唯一的完成信号
 - **CDN size 不匹配处理**：API 的 `file.size` 可能比 CDN 实际字节大，合并时跳过不存在的 `.part`，按实到为准
 
@@ -105,6 +109,11 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 11. **用 `exit` 而不是 `close` 判子进程结束**：子进程还会继承 stdout 管道，`close` 要等所有继承句柄释放，表现为"早就完事了但状态还挂着"。
 12. **Edge 窗口任务栏占位**：`--window-position=-32000,-32000` 只是把窗口挪到屏幕外，任务栏按钮还在。用 `hide_window.ps1`（Win32 API：WS_EX_TOOLWINDOW + SetParent）摘掉。
 13. **`_probe()` 判定 bug**：`evalJs()` 返回的是解包后的原始值（`1+1` 直接得 `2`），不是 `{result:{value:2}}`。判定必须写 `rb === 2`，不能写 `rb?.result?.value === 2`（恒 false → 永远误报 dead）。
+14. **CDN 直链 404 ≠ 直链过期**：某视频 Source/360/540 同时 404 而 preview 仍 206，说明文件已从 CDN 删除（API 元数据还在）。`segment.ps1` 必须 exit 6、`task.ps1` 直接 failed；当成可重试会 8 段×50 次 + 看门狗无限重启，能空转到 12 小时。修好后实测 2.6 秒失败。
+15. **`HttpWebResponse` 没有 `ContentRange` 属性**：老代码 `$resp.ContentRange` 恒为 `$null`，`.prog` 里 `serverTotal` 永远是 -1，“以 CDN 实长判定完成”那条规则其实从没生效，全靠末段撞 416 兜底。必须解析 `$resp.Headers['Content-Range']`。
+16. **`kill()` 不杀进程树**：`t.childProc.kill()` 只终止 `powershell.exe`，`Start-Process` 出来的 `segment.ps1` 变孤儿继续写同一批 `.part`。实测一次“删除重建”留下 4 个 task.ps1 + 32 个 segment.ps1，8 个 `.part` 全 0 字节、进度永远 0%。规则：停止/移除/重试/退出一律 `taskkill /PID <pid> /T /F`；`task.ps1` 必须持单实例锁。
+17. **ESM 里没有 `require`**：`browser.mjs` 的 `hideTaskbar()` 曾写 `require('child_process')`，每次抛 ReferenceError 又被 `try{}catch{}` 吞掉 → 窗口其实从没藏住。用文件顶部 `import { spawnSync }`。
+18. **`tokens.json` 只写不读 = 每次重启都要重登**：access token 只有 1 小时。启动时恢复 access、过期用 refresh token 换，才能“打开面板就能用”；`/api/relogin` 只应该是兜底。
 
 ## 7. 常见任务配方
 
@@ -114,7 +123,9 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 | 换档位（不要 Source） | 改 `quality`（`Source`/`540`/`360`） |
 | 只下载不点赞 | 改 `config.local.json` 的 `likeBeforeDownload=false`（重启面板生效，日志会打"配置关闭了自动点赞，跳过"） |
 | 补跑中断的任务 | 直接重启面板：队列自动重新排队，`.part` 从断点续 |
-| 令牌失效/被登出 | 面板点「重新登录」，或 `POST /api/relogin` |
+| 令牌失效/被登出 | 面板点「重新登录」，或 `POST /api/relogin`（立即 202，进度看顶部芯片） |
+| 日志占空间 | `logs\panel.log` 超过 `logMaxMb`(默认 8MB) 自动轮转为 `panel.log.1`；`logs\seg\` 只保留 7 天，成功任务的段日志即时删除 |
+| 清掉某个任务的残留分片 | 删 `E:\administrator\iwara-out\*<视频ID>*.part*`（先确保该任务没在跑） |
 | CF 一直过不去 | 删 `state/edgeprofile/` 后重启，第一次手动在弹出的 Edge 窗口里过一次 |
 | 改完 .ps1 的校验 | `Get-ChildItem -Recurse -Filter *.ps1 \| % { [IO.File]::WriteAllText($_.FullName, [IO.File]::ReadAllText($_.FullName, (New-Object Text.UTF8Encoding $false)), (New-Object Text.UTF8Encoding $true)) }` 补 BOM，再用 `Parser::ParseFile` 查语法 |
 | 单视频手工验证 | `powershell -File engine\task.ps1 -TaskFile state\tasks\<id>.json` |
@@ -132,7 +143,10 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 - 点赞已真实生效多次；后续任务对已赞视频会跳过（日志"已经赞过了，跳过"）
 - 断点续传路径已被真实覆盖：服务被 kill 后重启，`.part` 从断点续
 - 断线自愈已验证：Edge 窗口被关/CDP 超时后，`ensureLogin()` 自动杀浏览器重拉 + re-hide
-- 任务栏隐藏已验证：Edge 窗口启动后自动从任务栏摘掉（`hide 3 window(s)`）
+- 任务栏隐藏已验证：Edge 窗口启动后自动从任务栏摘掉（`hide 1+ window(s)`）；2026-11-15 修掉了 ESM 里 `require` 未定义导致 hide 静默失效的问题
+- 登录体验：启动恢复 `tokens.json` → 预热登录 → 面板直接显示“已登录”；`/api/relogin` 立即 202，进度在顶部芯片按阶段+秒数走
+- 卡死防护：单实例锁、`taskkill /T` 回收进程树、`staleProgressSec` 僵死检测、看门狗总预算、404 直接失败（实测 2.6s）
+- 磁盘：`logs\panel.log` 达 `logMaxMb` 自动轮转；`logs\seg\` 保留 7 天；状态/日志/Edge profile 全在项目目录（E 盘），不占 C 盘
 - 进度条修复：`pollProgress()` 对 `status === 'done'` 的任务也回读 `total`，CDN 实到写回后进度条到 100%
 - `config.local.json` 的全部字段均已接线；面板日志落盘 `logs\panel.log` 已验证
 - 桌面快捷方式：`start.vbs`（无窗口后台启动）+ `iwaraMachine.ico`（多尺寸标准 ICO）

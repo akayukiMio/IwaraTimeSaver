@@ -31,15 +31,30 @@ function toast(msg, kind = '') {
 }
 
 // ------------------------------------------------------------------ 状态渲染
+const AUTH_CN = {
+  idle: '未登录', starting: '启动浏览器通道', cf: '过 Cloudflare', token: '刷新令牌',
+  login: '登录中', ok: '已登录', error: '登录失败',
+};
+function authBusy() {
+  const ph = meta.auth?.phase || 'idle';
+  return ph === 'starting' || ph === 'cf' || ph === 'token' || ph === 'login';
+}
 function renderChips() {
   const c = [];
+  const a = meta.auth || {};
+  const busy = authBusy();
+  const authText = busy
+    ? `${AUTH_CN[a.phase] || a.phase}… ${a.elapsed ?? 0}s`
+    : (meta.loggedIn ? '已登录' : (AUTH_CN[a.phase] || a.phase || '未登录'));
   c.push(`<span class="chip">档位 <b>${meta.quality || '-'}</b></span>`);
   c.push(`<span class="chip">并发 <b>${meta.maxTasks || '-'} 文件 × ${meta.segments || '-'} 段</b></span>`);
   c.push(`<span class="chip">聚合速度 <b>${(meta.speed || 0).toFixed(2)} MB/s</b></span>`);
   c.push(`<span class="chip">在跑 <b>${meta.running || 0}</b> / 队列 <b>${meta.tasks || 0}</b></span>`);
-  c.push(`<span class="chip${meta.loggedIn ? '' : ' warn'}">登录 <b>${meta.loggedIn ? '已登录' : '未登录'}</b></span>`);
-  c.push(`<span class="chip${meta.browserUp ? '' : ' warn'}">浏览器通道 <b>${meta.browserUp ? '在线' : '未启动'}</b></span>`);
+  c.push(`<span class="chip${meta.loggedIn ? '' : ' warn'}" title="${esc(a.detail || '')}">登录 <b>${esc(authText)}</b></span>`);
+  const browserText = meta.browserUp ? '在线' : (meta.loggedIn ? '按需启动' : '未启动');
+  c.push(`<span class="chip${meta.browserUp ? '' : ' warn'}">浏览器通道 <b>${browserText}</b></span>`);
   $('#chips').innerHTML = c.join('');
+  $('#btnRelogin').disabled = busy;
   if (meta.segments) $('#segTip').textContent = meta.segments;
 }
 function renderRows() {
@@ -74,6 +89,7 @@ function renderRows() {
     </div>`;
   }).join('');
   list.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('移除该任务？（会终止它的下载进程；已下载的分片会保留，可续传）')) return;
     try { await api('/api/remove', { id: b.dataset.del }); } catch (e) { toast(e.message, 'err'); }
   }));
   list.querySelectorAll('[data-retry]').forEach((b) => b.addEventListener('click', async () => {
@@ -168,8 +184,10 @@ $('#btnEnqueue').addEventListener('click', async () => {
 $('#btnStart').addEventListener('click', () => api('/api/start').then(() => toast('已继续队列', 'ok')).catch((e) => toast(e.message, 'err')));
 $('#btnStop').addEventListener('click', () => api('/api/stop', {}).then(() => toast('已请求停止（在跑的分段进程会被终止，进度保留可续）', 'ok')).catch((e) => toast(e.message, 'err')));
 $('#btnRelogin').addEventListener('click', async () => {
-  toast('正在通过浏览器通道重新登录…');
-  try { await api('/api/relogin', {}); toast('登录完成', 'ok'); } catch (e) { toast(e.message, 'err'); }
+  try {
+    await api('/api/relogin', {});
+    toast('已开始重新登录，进度看顶部「登录」芯片');
+  } catch (e) { toast(e.message, 'err'); }
 });
 $('#btnOut').addEventListener('click', () => api('/api/local', { what: 'outdir' }).catch((e) => toast(e.message, 'err')));
 $('#btnRetryFailed').addEventListener('click', () => api('/api/retry', {}).then((r) => toast(`已重排 ${r.retried} 个`, 'ok')).catch((e) => toast(e.message, 'err')));

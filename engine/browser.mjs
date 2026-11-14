@@ -13,7 +13,7 @@
 //
 //  零 npm 依赖：Node 24 自带全局 WebSocket，直接说 CDP。
 // =============================================================================
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -167,8 +167,12 @@ export class Browser {
 
   /** 登录：实测 POST /user/login 返回 {token:<refresh JWT>}（有 30 天 exp），
    *  再用它调 POST /user/token 换 accessToken。页面内 fetch 能直接过 Cloudflare，
-   *  不需要 Turnstile；只有这条路挂了才退到表单自动化。 */
-  async login(email, password) {
+   *  不需要 Turnstile。
+   *
+   *  ⚠️ 表单回退默认关闭（formFallback=false）：它会 Page.navigate 到 /login，
+   *  把**共享页面**上的其它并发 apiFetch 一起打断，还要等 90s CF，是“重新登录很慢”的
+   *  主要来源之一。确实需要时再开（config.local.json: formLoginFallback=true）。 */
+  async login(email, password, { formFallback = false } = {}) {
     const direct = await this.apiFetch('POST', '/user/login', { body: { email, password } });
     const rt = String(direct.json?.token || direct.json?.refreshToken || '');
     if (direct.status === 200 && rt && rt.split('.').length === 3) {
@@ -178,7 +182,11 @@ export class Browser {
       throw new Error(`拿到 refresh token，但 /user/token 没给 accessToken（HTTP ${t.status} ${String(t.text).slice(0, 120)}）`);
     }
     say_login_fail(direct);
-    // 回退：驱动登录表单
+    if (!formFallback) {
+      throw new Error(`页面内直连登录失败（HTTP ${direct.status} ${String(direct.text || '').slice(0, 120)}）；` +
+        '表单回退默认关闭（它会导航共享页面、打断并发任务），确需启用请把 config.local.json 的 formLoginFallback 设为 true');
+    }
+    // 回退：驱动登录表单（会占用共享页面，只在没有并发任务时才值得用）
     await this._send('Page.navigate', { url: 'https://www.iwara.tv/login' });
     await sleep(3500);
     await this._waitCfPass();
@@ -234,11 +242,13 @@ export class Browser {
     throw new Error('登录后没拿到 token（可能卡在 Turnstile/验证码，需要你看一眼那个 Edge 窗口）');
   }
 
-  /** 把 CDP 的 Edge 窗口从任务栏摘掉（WS_EX_TOOLWINDOW + SetParent 强制刷新） */
+  /** 把 CDP 的 Edge 窗口从任务栏摘掉（WS_EX_TOOLWINDOW + SetParent 强制刷新）
+   *  ⚠️ 这里曾经写成 require('child_process')：ESM 里 require 未定义 → 每次都抛
+   *  ReferenceError，被上层 try/catch 吞掉 → 窗口其实从没藏住。必须用顶部 import 的 spawnSync。 */
   async hideTaskbar() {
     const ps = 'powershell.exe';
     const script = path.join(ROOT, 'engine', 'hide_window.ps1');
-    const r = require('child_process').spawnSync(ps, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Port', String(this.port), '-Action', 'hide'], {
+    const r = spawnSync(ps, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Port', String(this.port), '-Action', 'hide'], {
       timeout: 10000, windowsHide: true, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
     });
     if (r.error || !String(r.stdout || '').includes('window(s)')) {

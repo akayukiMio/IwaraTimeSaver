@@ -7,7 +7,10 @@
 //  两边只通过 state/tasks/<id>.json 这个文件通信：段边界由 (size, 段数) 唯一决定，
 //  所以任何一层重启都能从磁盘接着干，不记内存账。
 //
-//  只监听 127.0.0.1；端口固定不顺延（顺年会开出多个各自持锁的实例 → 并发下载互相拖慢）。
+//  ⚠️ 进程管理铁律：kill() 只杀 powershell.exe 本身，Start-Process 出来的 segment.ps1
+//     会变孤儿继续写 .part。所有“停止/移除/重试/退出”都必须 killTree()（taskkill /T /F）。
+//
+//  只监听 127.0.0.1；端口固定不顺延（顺延会开出多个各自持锁的实例 → 并发下载互相拖慢）。
 // =============================================================================
 import http from 'node:http';
 import fs from 'node:fs';
@@ -23,8 +26,10 @@ const TASK_PS = path.join(ROOT, 'engine', 'task.ps1');
 const STATE = path.join(ROOT, 'state');
 const TASKDIR = path.join(STATE, 'tasks');
 const QUEUE = path.join(STATE, 'queue.json');
+const TOKENS = path.join(STATE, 'tokens.json');
 const STOPFLAG = path.join(STATE, 'stop.flag');
 const LOGFILE = path.join(ROOT, 'logs', 'panel.log');
+const SEGLOGDIR = path.join(ROOT, 'logs', 'seg');
 const HOST = '127.0.0.1';
 
 const CFG = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.local.json'), 'utf8'));
@@ -33,9 +38,12 @@ const APP_ID = 'iwara-machine';
 const FLUSH_MS = 60;
 const OPEN_BROWSER = process.argv.includes('--open');
 const EXTRA_HOSTS = String(process.env.IWARA_WEB_HOSTS || '').split(',').map((s) => s.trim()).filter(Boolean);
+const STALE_SEC = Math.max(30, Number(CFG.staleProgressSec) || 180);   // 进度文件多久没更新算僵死
+const LOG_MAX = Math.max(1, Number(CFG.logMaxMb) || 8) * 1024 * 1024; // 单个日志文件上限
 
 fs.mkdirSync(TASKDIR, { recursive: true });
 fs.mkdirSync(path.join(ROOT, 'logs'), { recursive: true });
+fs.mkdirSync(SEGLOGDIR, { recursive: true });
 try { fs.rmSync(STOPFLAG, { force: true }); } catch { /* 忽略 */ }
 
 // ---------------------------------------------------------------- 任务表
@@ -43,10 +51,21 @@ const tasks = new Map();          // id -> task
 let browser = null;
 let browserStarting = null;
 let token = null;
+let loginPromise = null;
 let LISTEN_PORT = PORT;
 const listeners = new Set();
 const outbox = [];
 let outboxTimer = null;
+const auth = { phase: 'idle', detail: '', since: Date.now() };
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function setAuth(phase, detail) {
+  auth.phase = phase;
+  auth.detail = detail || '';
+  auth.since = Date.now();
+  pushState();
+}
 
 function saveQueue() {
   const keep = [...tasks.values()].map((t) => ({
@@ -71,22 +90,188 @@ loadQueue();
 function readJson(p) {
   try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
 }
-// task.ps1 把进度写进 state/tasks/<id>.json；服务端每秒回读一次再广播给页面。
-// 两层只靠这个文件通信，所以任何一方重启都不丢进度。
-function pollProgress() {
-  for (const t of tasks.values()) {
-    // downloading 时持续同步进度；done 时再回读一次 total（task.ps1 会把 CDN 实到写回 total）
-    if (t.status !== 'downloading' && t.status !== 'done') continue;
-    const j = readJson(path.join(TASKDIR, `${t.id}.json`));
-    if (!j) continue;
-    if (typeof j.done === 'number') t.done = j.done;
-    if (typeof j.total === 'number' && j.total) t.total = j.total;
-    if (typeof j.percent === 'number') t.percent = j.percent;
-    if (typeof j.speed === 'number') t.speed = j.speed;
-    if (typeof j.segAlive === 'number') t.segAlive = j.segAlive;
-  }
+
+// ---------------------------------------------------------------- 日志（落盘 + 轮转）
+let logBytes = 0;
+try { logBytes = fs.statSync(LOGFILE).size; } catch { logBytes = 0; }
+function rotateLog() {
+  if (logBytes <= LOG_MAX) return;
+  try {
+    try { fs.rmSync(`${LOGFILE}.1`, { force: true }); } catch { /* 忽略 */ }
+    fs.renameSync(LOGFILE, `${LOGFILE}.1`);
+  } catch { /* 轮转失败就继续追加 */ }
+  logBytes = 0;
+}
+function log(id, text) {
+  emit('log', { id, text, at: Date.now() });
+  // 面板日志必须落盘：服务是从隐藏窗口起的，不落盘就只能靠猜
+  try {
+    const line = `${new Date().toISOString().slice(11, 19)} [${id}] ${text}\n`;
+    rotateLog();
+    fs.appendFileSync(LOGFILE, line, 'utf8');
+    logBytes += Buffer.byteLength(line);
+  } catch { /* 写不进去不阻断任务 */ }
 }
 
+// 清掉过期的段日志（失败任务的现场保留 7 天）
+function sweepSegLogs(days = 7) {
+  const cutoff = Date.now() - days * 86400 * 1000;
+  let n = 0;
+  try {
+    for (const f of fs.readdirSync(SEGLOGDIR)) {
+      const p = path.join(SEGLOGDIR, f);
+      try { if (fs.statSync(p).mtimeMs < cutoff) { fs.rmSync(p, { force: true }); n++; } } catch { /* 忽略 */ }
+    }
+  } catch { /* 忽略 */ }
+  return n;
+}
+
+// ---------------------------------------------------------------- 进程树
+function killTree(pid) {
+  if (!pid) return;
+  try { spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 8000 }); } catch { /* 已退出 */ }
+}
+
+// 上次异常退出留下的 task.ps1（持锁）必须在调度前清掉，否则新任务会和旧孤儿抢 .part。
+// 杀之前先确认 pid 真的还是 powershell.exe：pid 可能已被无关进程复用。
+function procName(pid) {
+  try {
+    const r = spawnSync('tasklist', ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], { windowsHide: true, encoding: 'utf8', timeout: 5000 });
+    const s = String(r.stdout || '').trim();
+    if (!s || /No tasks/i.test(s)) return '';
+    const m = /^"([^"]+)"/.exec(s);
+    return m ? m[1].toLowerCase() : '';
+  } catch { return ''; }
+}
+function sweepOrphans() {
+  let n = 0;
+  try {
+    for (const f of fs.readdirSync(TASKDIR)) {
+      if (!f.endsWith('.json.lock')) continue;
+      const p = path.join(TASKDIR, f);
+      let pid = 0;
+      try { pid = Number(String(fs.readFileSync(p, 'utf8')).trim()); } catch { /* 忽略 */ }
+      if (pid > 0) {
+        const name = procName(pid);
+        if (name === 'powershell.exe') { killTree(pid); n++; log('system', `清理上次残留的下载进程树 pid=${pid}`); }
+        else if (name) log('system', `锁文件 pid=${pid} 已被 ${name} 复用，只删锁不杀进程`);
+      }
+      try { fs.rmSync(p, { force: true }); } catch { /* 忽略 */ }
+    }
+  } catch { /* 目录还不存在 */ }
+  return n;
+}
+
+// ---------------------------------------------------------------- 令牌
+function readTokens() { return readJson(TOKENS); }
+function jwtExpMs(tok) {
+  try {
+    const payload = JSON.parse(Buffer.from(String(tok).split('.')[1], 'base64url').toString('utf8'));
+    return Number(payload.exp) * 1000 || 0;
+  } catch { return 0; }
+}
+function writeTokens(accessToken, refreshToken, via) {
+  try {
+    fs.writeFileSync(TOKENS, JSON.stringify({ accessToken, refreshToken, via, savedAt: Date.now() }, null, 2), 'utf8');
+  } catch { /* 令牌缓存写失败不影响本次 */ }
+}
+// 启动即恢复本地令牌：没必要每次开面板都重新走一遍浏览器登录
+function restoreToken() {
+  const j = readTokens();
+  if (j?.accessToken && jwtExpMs(j.accessToken) > Date.now() + 120000) {
+    token = j.accessToken;
+    auth.phase = 'ok'; auth.detail = '已恢复本地令牌'; auth.since = Date.now();
+    return true;
+  }
+  if (j?.refreshToken) {
+    auth.phase = 'idle'; auth.detail = '有刷新令牌，首次调用时换取 access'; auth.since = Date.now();
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------- 浏览器通道
+async function getBrowser() {
+  if (browser) return browser;
+  if (!browserStarting) {
+    browserStarting = Browser.start({ profileDir: path.join(STATE, 'edgeprofile'), port: CFG.cdpPort || 9333 })
+      .then((b) => { browser = b; browserStarting = null; return b; })
+      .catch((e) => { browserStarting = null; throw e; });
+  }
+  return browserStarting;
+}
+
+async function applyLogin(r) {
+  token = r.accessToken;
+  writeTokens(r.accessToken, r.refreshToken, r.via);
+  setAuth('ok', `已登录 via=${r.via}`);
+  log('system', `登录完成 via=${r.via}`);
+  return token;
+}
+
+/** 用本地 refresh token 换 access；失败再走账号密码（单次） */
+async function loginWith(b) {
+  const saved = readTokens();
+  if (saved?.refreshToken) {
+    setAuth('token', '用本地 refresh token 换 access');
+    try {
+      const t = await b.apiFetch('POST', '/user/token', { token: saved.refreshToken });
+      const at = String(t.json?.accessToken || t.json?.access_token || t.json?.token || '');
+      if (at) return applyLogin({ accessToken: at, refreshToken: saved.refreshToken, via: 'refresh' });
+      log('system', `refresh token 已失效（HTTP ${t.status}），改用账号密码`);
+    } catch (e) {
+      log('system', `refresh token 请求失败：${e.message}`);
+    }
+  }
+  setAuth('login', '账号密码登录');
+  const r = await b.login(CFG.email, CFG.password, { formFallback: CFG.formLoginFallback === true });
+  return applyLogin(r);
+}
+
+async function doLogin() {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      setAuth('starting', attempt ? `重启浏览器通道（第 ${attempt + 1} 次）` : '启动浏览器通道');
+      const b = await getBrowser();
+      return await loginWith(b);
+    } catch (e) {
+      lastErr = e;
+      log('system', `登录失败（第 ${attempt + 1}/2）：${e.message}`);
+      const dead = browser;
+      browser = null;
+      if (dead && !dead.reused) { try { await dead.stop(); } catch { /* 忽略 */ } }
+      if (attempt === 0) await sleep(1500);
+    }
+  }
+  setAuth('error', lastErr?.message || '登录失败');
+  throw lastErr || new Error('登录失败');
+}
+
+// 单飞：两个任务同时入队时只登录一次，避免抢同一个共享页面
+function ensureLogin() {
+  if (token) return Promise.resolve(token);
+  if (!loginPromise) loginPromise = doLogin().finally(() => { loginPromise = null; });
+  return loginPromise;
+}
+
+async function apiFetch(method, urlOrPath, opts = {}) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const b = await getBrowser();
+    const t = await ensureLogin();
+    const r = await b.apiFetch(method, urlOrPath, { ...opts, token: t });
+    if (r.status === 401 && attempt === 0) {
+      // 令牌被吊销/过期：清掉重登一次（403 多数是 CF 挑战，重登没用）
+      log('system', '令牌被拒（401），重新获取后重试');
+      token = null;
+      setAuth('token', '令牌被拒，重新获取');
+      continue;
+    }
+    return r;
+  }
+  return { status: 0, text: '', json: null };
+}
+
+// ---------------------------------------------------------------- 状态快照
 function emit(ev, data) {
   outbox.push({ ev, data });
   if (!outboxTimer) outboxTimer = setTimeout(flushOutbox, FLUSH_MS);
@@ -99,12 +284,6 @@ function flushOutbox() {
     try { res.write(`event: batch\ndata: ${JSON.stringify(batch)}\n\n`); } catch { /* 客户端断开 */ }
   }
 }
-function log(id, text) {
-  emit('log', { id, text, at: Date.now() });
-  // 面板日志必须落盘：服务是从隐藏窗口起的，不落盘就只能靠猜
-  try { fs.appendFileSync(LOGFILE, `${new Date().toISOString().slice(11, 19)} [${id}] ${text}\n`); } catch { /* 写不进去不阻断任务 */ }
-}
-
 function summary() {
   let done = 0, total = 0, speed = 0, running = 0;
   for (const t of tasks.values()) {
@@ -115,7 +294,9 @@ function summary() {
     tasks: tasks.size, running, speed: Math.round(speed * 100) / 100,
     doneMb: Math.round(done / 1048576 * 10) / 10, totalMb: Math.round(total / 1048576 * 10) / 10,
     percent: total ? Math.round(done * 1000 / total) / 10 : 0,
-    loggedIn: !!token, browserUp: !!browser, maxTasks: CFG.maxTasks || 2, segments: CFG.segmentsPerFile || 8,
+    loggedIn: !!token, browserUp: !!browser || !!browserStarting,
+    auth: { phase: auth.phase, detail: auth.detail, since: auth.since, elapsed: Math.round((Date.now() - auth.since) / 1000) },
+    maxTasks: CFG.maxTasks || 2, segments: CFG.segmentsPerFile || 8,
     outDir: CFG.outDir, quality: CFG.quality || 'Source',
   };
 }
@@ -131,67 +312,35 @@ function snapshot() {
 }
 function pushState() { emit('state', snapshot()); }
 
-// ---------------------------------------------------------------- 浏览器通道
-async function getBrowser() {
-  if (browser) return browser;
-  if (!browserStarting) {
-    browserStarting = Browser.start({ profileDir: path.join(STATE, 'edgeprofile'), port: CFG.cdpPort || 9333 })
-      .then((b) => { browser = b; browserStarting = null; return b; })
-      .catch((e) => { browserStarting = null; throw e; });
-  }
-  return browserStarting;
-}
-async function ensureLogin() {
-  if (token) return token;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const b = await getBrowser();
-    // 先用 _probe() 探测 CDP 是否真的活着；如果从 stale 连接恢复，不要直接调 evalJs()
-    // （Runtime.evaluate 可能永久挂住）
-    try {
-      if (await b._probe()) { throw new Error('browser dead, restarting'); }
-    } catch (e) {
-      console.error('[ensureLogin] _probe failed:', e.message);
-      // 杀了断掉的浏览器
-      if (browser && !browser.reused) { try { await browser.stop(); } catch { } }
-      browser = null;
-      if (attempt === 0) { await new Promise((r) => setTimeout(r, 2000)); continue; }
-      throw e;
-    }
-    // login 前必须保证浏览器已过 Cloudflare；如果 WebSocket 是从死连接恢复的，\_waitCfPass 会先导航到 blank 页面
-    try { await b._waitCfPass(5000); } catch { /* 不要阻塞 */ }
-    try {
-      const r = await b.login(CFG.email, CFG.password);
-      token = r.accessToken;
-      browser = null; // 强制下次任务入队时重启浏览器（CF clearance 干净）
-      try {
-        fs.writeFileSync(path.join(STATE, 'tokens.json'), JSON.stringify({
-          accessToken: r.accessToken, refreshToken: r.refreshToken, via: r.via, savedAt: Date.now(),
-        }, null, 2), 'utf8');
-      } catch { /* 令牌缓存写失败不影响本次 */ }
-      log('system', `登录完成 via=${r.via}`);
-      return token;
-    } catch (e) {
-      console.error(`[ensureLogin] attempt ${attempt} failed:`, e.message);
-      // 杀了这断掉的浏览器，下次循环 getBrowser 会拉起新的
-      if (browser && !browser.reused) { try { await browser.stop(); } catch { } }
-      browser = null;
-      if (attempt === 0) { await new Promise((r) => setTimeout(r, 3000)); continue; }
-      throw e; // 两次都失败 -> 交给上层处理
+// ---------------------------------------------------------------- 进度回读 + 僵死检测
+function pollProgress() {
+  const now = Date.now();
+  for (const t of tasks.values()) {
+    if (t.status !== 'downloading' && t.status !== 'done') continue;
+    const p = path.join(TASKDIR, `${t.id}.json`);
+    let j = null;
+    try { j = JSON.parse(fs.readFileSync(p, 'utf8')); } catch { continue; }
+    if (typeof j.done === 'number') t.done = j.done;
+    if (typeof j.total === 'number' && j.total) t.total = j.total;
+    if (typeof j.percent === 'number') t.percent = j.percent;
+    if (typeof j.speed === 'number') t.speed = j.speed;
+    if (typeof j.segAlive === 'number') t.segAlive = j.segAlive;
+    if (j.error && t.status === 'downloading') t.error = String(j.error).slice(0, 300);
+    if (t.status !== 'downloading') continue;
+    if (j.updatedAt !== t.progressAt) { t.progressAt = j.updatedAt || ''; t.progressTs = now; continue; }
+    if (!t.childProc) continue;
+    // task.ps1 每 700ms 写一次 updatedAt；这么久没动静说明进程卡死或已变成孤儿
+    const idle = now - (t.progressTs || t.startedTs || now);
+    if (idle > STALE_SEC * 1000) {
+      killTree(t.childProc.pid);
+      t.childProc = null;
+      t.status = 'failed';
+      t.error = `进度 ${Math.round(idle / 1000)}s 未更新（进程无响应），已回收`;
+      log(t.id, '❌ ' + t.error);
+      saveQueue();
+      pushState();
     }
   }
-  throw new Error('登录失败（2次重试均失败）');
-}
-async function apiFetch(method, urlOrPath, opts = {}) {
-  const b = await getBrowser();
-  const t = await ensureLogin();
-  const r = await b.apiFetch(method, urlOrPath, { ...opts, token: t });
-  if (r.status === 401 || r.status === 403) {
-    // 令牌可能被吊销/过期：强制重登一次
-    token = null;
-    const t2 = await ensureLogin();
-    return b.apiFetch(method, urlOrPath, { ...opts, token: t2 });
-  }
-  return r;
 }
 
 // ---------------------------------------------------------------- 解析与执行
@@ -244,12 +393,15 @@ async function resolveTask(t) {
   const want = CFG.quality || 'Source';
   const src = list.find((s) => s.name === want) || list.find((s) => s.name === 'Source') || list[0];
   if (!src?.src?.download) throw new Error('没有可用的 download 直链');
+  // 注意：这里的 decodeURIComponent 会把 path=2026%2F10%2F21 解成 2026/10/21，
+  // 实测 CDN 两种写法都能过（不参与 hash 校验），保留以兼容旧行为。
   t.url = decodeURIComponent(`https:${src.src.download}`);
   t.quality = src.name;
   const dir = CFG.outDir;
   fs.mkdirSync(dir, { recursive: true });
   t.outFile = path.join(dir, `${safeName(t.title)}[${t.id}]${extOf(v.file?.name, src.mime)}`);
   t.expires = (() => { const m = /[?&]expires=(\d+)/.exec(t.url); return m ? Number(m[1]) : 0; })();
+  t.taskFile = path.join(TASKDIR, `${t.id}.json`);
   log(t.id, `解析完成 ${t.quality} ${(t.size / 1048576).toFixed(1)}MB -> ${path.basename(t.outFile)}`);
   writeTaskFile(t);
 }
@@ -265,10 +417,16 @@ function writeTaskFile(t) {
 }
 
 function runTask(t) {
-  t.status = 'downloading'; t.childProc = spawn('powershell.exe',
+  if (t.childProc) return;
+  t.status = 'downloading';
+  t.startedTs = Date.now();
+  t.progressTs = Date.now();
+  t.progressAt = '';
+  const proc = spawn('powershell.exe',
     ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', TASK_PS, '-TaskFile', t.taskFile],
     { cwd: ROOT, windowsVerbatimArguments: false, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-  const onData = (stream, kind) => {
+  t.childProc = proc;
+  const onData = (stream) => {
     let rest = '';
     const dec = new TextDecoder('utf-8', { fatal: false });
     stream.on('data', (chunk) => {
@@ -278,22 +436,48 @@ function runTask(t) {
     });
     stream.on('end', () => { rest += dec.decode(); if (rest.trim()) log(t.id, rest.trim()); });
   };
-  onData(t.childProc.stdout, 'out');
-  onData(t.childProc.stderr, 'err');
+  onData(proc.stdout);
+  onData(proc.stderr);
   // 用 exit 判完成（close 要等继承句柄，会被子进程拖住）
-  t.childProc.on('exit', (code) => onTaskExit(t, code));
-  t.childProc.on('error', (e) => { t.error = e.message; t.status = 'failed'; log(t.id, '启动下载进程失败: ' + e.message); pushState(); saveQueue(); });
+  proc.on('exit', (code) => { if (t.childProc === proc) onTaskExit(t, code); });
+  proc.on('error', (e) => {
+    t.childProc = null;
+    t.error = e.message; t.status = 'failed';
+    log(t.id, '启动下载进程失败: ' + e.message);
+    pushState(); saveQueue();
+  });
 }
 
 async function onTaskExit(t, code) {
   t.childProc = null;
+  // 主动杀树后等 exit 事件再重排（避免新旧两个 task.ps1 抢 .part）
+  if (t.afterKill === 'requeue') {
+    t.afterKill = null;
+    t.status = 'queued'; t.error = ''; t.tries = 0;
+    log(t.id, '已回收旧下载进程，重新排队');
+    pushState(); saveQueue();
+    setTimeout(schedule, 300);
+    return;
+  }
   if (code === 0) {
-    t.status = 'done'; t.percent = 100; t.speed = 0;
+    t.status = 'done'; t.percent = 100; t.speed = 0; t.error = '';
     if (!t.done && t.total) t.done = t.total;      // 不补这一步，已完成行会显示 0 / 275 MB
     log(t.id, '✅ 下载完成');
     pushState(); saveQueue(); return;
   }
   if (t.status === 'stopped' || code === 5) { t.status = 'stopped'; log(t.id, '已停止'); pushState(); saveQueue(); return; }
+  if (code === 6) {
+    t.status = 'failed';
+    t.error = '源文件在 CDN 不存在（HTTP 404），Source/转码文件可能已被删除，重试无意义';
+    log(t.id, '❌ ' + t.error);
+    pushState(); saveQueue(); return;
+  }
+  if (code === 9) {
+    t.status = 'failed';
+    t.error = '同一任务已有下载实例在运行（单实例锁冲突），已退出';
+    log(t.id, '❌ ' + t.error);
+    pushState(); saveQueue(); return;
+  }
   if (code === 3) {
     t.tries = (t.tries || 0) + 1;
     if (t.tries > 3) { t.status = 'failed'; t.error = '直链反复失效'; log(t.id, '❌ 直链反复失效，放弃'); pushState(); saveQueue(); return; }
@@ -305,7 +489,8 @@ async function onTaskExit(t, code) {
     } catch (e) { t.status = 'failed'; t.error = e.message; log(t.id, '重签名失败: ' + e.message); pushState(); saveQueue(); }
     return;
   }
-  t.status = 'failed'; t.error = `下载进程退出码 ${code}`;
+  t.status = 'failed';
+  t.error = code === 7 ? '分段反复停滞，已放弃（疑似 CDN 节点异常）' : `下载进程退出码 ${code}`;
   log(t.id, `❌ ${t.error}`);
   pushState(); saveQueue();
 }
@@ -316,18 +501,27 @@ let schedTimer = null;
 function schedule() {
   const max = Math.max(1, Number(CFG.maxTasks) || 2);
   let running = 0;
-  for (const t of tasks.values()) if (t.status === 'downloading' || t.status === 'resolving') running++;
+  for (const t of tasks.values()) {
+    if (t.starting || t.status === 'downloading' || t.status === 'resolving') running++;
+  }
   if (stopped || running >= max) return;
-  const next = [...tasks.values()].find((t) => t.status === 'queued' || t.status === 'failed' && (t.tries || 0) === 0 && t.retryOnce);
+  // 状态是唯一真值还不够：必须确认没有活着的子进程，否则会起第二个 task.ps1
+  const next = [...tasks.values()].find((t) => t.status === 'queued' && !t.childProc && !t.starting);
   if (!next) return;
-  startTask(next).catch((e) => { next.status = 'failed'; next.error = e.message; log(next.id, '失败: ' + e.message); pushState(); saveQueue(); });
+  startTask(next).catch((e) => {
+    next.status = 'failed'; next.error = e.message;
+    log(next.id, '失败: ' + e.message);
+    pushState(); saveQueue();
+  });
   setTimeout(schedule, 800);
 }
-async function startTask(t) {
-  await resolveTask(t);
-  t.taskFile = path.join(TASKDIR, `${t.id}.json`);
-  t.status = 'resolving'; pushState();
-  runTask(t);
+function startTask(t) {
+  if (t.starting || t.childProc) return Promise.resolve();
+  t.starting = true;
+  return (async () => {
+    try { await resolveTask(t); runTask(t); }
+    finally { t.starting = false; }
+  })();
 }
 
 // ---------------------------------------------------------------- 队列操作
@@ -336,7 +530,16 @@ function enqueue(links) {
   for (const raw of links) {
     const id = parseId(raw);
     if (!id) continue;
-    if (tasks.has(id)) { const old = tasks.get(id); if (old.status === 'done') continue; }
+    const old = tasks.get(id);
+    if (old) {
+      if (old.status === 'done') continue;
+      old.link = String(raw).trim() || old.link;
+      old.error = ''; old.tries = 0;
+      if (old.childProc) { old.afterKill = 'requeue'; killTree(old.childProc.pid); }
+      else old.status = 'queued';
+      added++;
+      continue;
+    }
     tasks.set(id, {
       id, link: String(raw).trim(), status: 'queued', percent: 0, done: 0, total: 0, speed: 0,
       addedAt: Date.now(), tries: 0, liked: null, childProc: null,
@@ -404,17 +607,21 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && p === '/api/stop') {
       stopped = true;
       try { fs.writeFileSync(STOPFLAG, String(Date.now())); } catch { /* 忽略 */ }
+      let n = 0;
       for (const t of tasks.values()) {
-        if (t.childProc) { try { t.childProc.kill(); } catch { /* 忽略 */ } }
+        if (t.childProc) { killTree(t.childProc.pid); n++; }
       }
-      return json(res, 200, { ok: true });
+      log('system', `已停止：回收 ${n} 个下载进程树`);
+      return json(res, 200, { ok: true, killed: n });
     }
     if (req.method === 'POST' && p === '/api/remove') {
       const b = await readBody(req);
       const id = String(b.id || '');
       const t = tasks.get(id);
-      if (t?.childProc) { try { t.childProc.kill(); } catch { /* 忽略 */ } }
-      tasks.delete(id); saveQueue(); pushState();
+      if (t?.childProc) killTree(t.childProc.pid);
+      tasks.delete(id);
+      try { fs.rmSync(path.join(TASKDIR, `${id}.json.lock`), { force: true }); } catch { /* 忽略 */ }
+      saveQueue(); pushState();
       return json(res, 200, { ok: true });
     }
     if (req.method === 'POST' && p === '/api/retry') {
@@ -422,7 +629,14 @@ const server = http.createServer(async (req, res) => {
       let n = 0;
       for (const t of tasks.values()) {
         if (b.id && t.id !== b.id) continue;
-        if (t.status === 'done') continue;
+        if (t.status === 'done' || t.status === 'queued' || t.status === 'resolving') continue;
+        if (t.childProc) {
+          // 批量“重试失败项”绝不能碰正在下载的任务；单任务重试才允许先杀树再重排
+          if (!b.id) continue;
+          t.afterKill = 'requeue';
+          killTree(t.childProc.pid);
+          n++; continue;
+        }
         t.status = 'queued'; t.error = ''; t.tries = 0; n++;
       }
       saveQueue(); pushState(); stopped = false;
@@ -430,7 +644,13 @@ const server = http.createServer(async (req, res) => {
       setTimeout(schedule, 200);
       return json(res, 200, { retried: n });
     }
-    if (req.method === 'POST' && p === '/api/relogin') { token = null; try { await ensureLogin(); } catch (e) { return json(res, 500, { error: e.message }); } pushState(); return json(res, 200, { ok: true }); }
+    if (req.method === 'POST' && p === '/api/relogin') {
+      // 立刻返回 202，进度通过 auth 状态推送；不再让浏览器干等 1-2 分钟
+      token = null;
+      setAuth('starting', '手动重新登录');
+      ensureLogin().catch((e) => { log('system', '重新登录失败：' + e.message); setAuth('error', e.message); });
+      return json(res, 202, { ok: true, accepted: true });
+    }
     if (req.method === 'POST' && p === '/api/local') {
       const b = await readBody(req);
       const map = { outdir: CFG.outDir, logdir: path.join(ROOT, 'logs'), project: ROOT };
@@ -443,7 +663,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'POST' && p === '/api/shutdown') {
       stopped = true;
-      for (const t of tasks.values()) if (t.childProc) { try { t.childProc.kill(); } catch { /* 忽略 */ } }
+      for (const t of tasks.values()) if (t.childProc) killTree(t.childProc.pid);
       try { browser?.stop(); } catch { /* 忽略 */ }
       setTimeout(() => process.exit(0), 300);
       return json(res, 200, { ok: true });
@@ -479,6 +699,14 @@ function openBrowser(port) {
   spawn('explorer.exe', [`http://${HOST}:${port}/`], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
 }
 
+// 启动预热：打开面板时浏览器/登录已经在后台准备，而不是等你点“重新登录”才开始计时
+function warmUp() {
+  if (stopped) return;
+  ensureLogin()
+    .then(() => log('system', '浏览器通道预热完成'))
+    .catch((e) => log('system', '预热登录失败：' + e.message));
+}
+
 async function main() {
   const other = await probe(PORT);
   if (other) {
@@ -490,14 +718,22 @@ async function main() {
   server.listen(PORT, HOST, () => {
     LISTEN_PORT = PORT;
     try { fs.writeFileSync(lockPath(PORT), JSON.stringify({ app: APP_ID, pid: process.pid, port: PORT })); } catch { /* 忽略 */ }
+    // 先清上次残留的下载进程树，再决定要不要开始调度
+    const killed = sweepOrphans();
+    const pruned = sweepSegLogs(7);
+    const restored = restoreToken();
     console.log('');
     console.log('  iwaraMachine · 面板已启动');
     console.log(`  地址      http://${HOST}:${PORT}/   (pid ${process.pid})`);
     console.log(`  输出目录  ${CFG.outDir}`);
     console.log(`  并发      文件 ${CFG.maxTasks} × 段 ${CFG.segmentsPerFile}，档位 ${CFG.quality}`);
-    console.log('  提示      API 通道会在首个任务时拉起 Edge（离屏窗口）；关掉本窗口即停服务');
+    console.log(`  登录      ${restored ? '已恢复本地令牌' : '需要登录（启动预热中）'}`);
+    if (killed) console.log(`  清理      ${killed} 个上次残留的下载进程树`);
+    if (pruned) console.log(`  日志      ${pruned} 个过期段日志已清理`);
+    console.log('  提示      API 通道会在需要时拉起 Edge（离屏窗口）；关掉本窗口即停服务');
     console.log('');
     if (OPEN_BROWSER) openBrowser(PORT);
+    if (CFG.warmBrowserOnStart !== false) setTimeout(warmUp, 600);
   });
   process.on('exit', () => { try { const l = JSON.parse(fs.readFileSync(lockPath(LISTEN_PORT), 'utf8')); if (l.pid === process.pid) fs.rmSync(lockPath(LISTEN_PORT), { force: true }); } catch { /* 忽略 */ } });
   process.on('SIGINT', () => process.exit(0));

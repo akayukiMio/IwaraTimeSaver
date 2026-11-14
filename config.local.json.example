@@ -1,4 +1,4 @@
-﻿{
+{
   "email": "你的 iwara 邮箱",
   "password": "你的 iwara 密码",
   "outDir": "E:\\administrator\\iwara-out",
@@ -8,5 +8,9 @@
   "segmentStallSec": 20,
   "webPort": 8811,
   "cdpPort": 9333,
-  "likeBeforeDownload": true
+  "likeBeforeDownload": true,
+  "warmBrowserOnStart": true,
+  "formLoginFallback": false,
+  "staleProgressSec": 180,
+  "logMaxMb": 8
 }
