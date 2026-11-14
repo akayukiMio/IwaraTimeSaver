@@ -80,6 +80,16 @@ try {
         if ($ErrorText) { $T | Add-Member -NotePropertyName error -NotePropertyValue $ErrorText -Force }
         $T | Add-Member -NotePropertyName status -NotePropertyValue $Status -Force
         Set-Status $T
+        # 404/410 是终止态：分片永远凑不齐，留着只会堆一堆 0 字节 .part/.prog
+        if ($Code -eq 6 -and $outFile) {
+            foreach ($s in $segs) {
+                foreach ($ext in '', '.prog') {
+                    $f = "$outFile.part$($s.index)$ext"
+                    if ([System.IO.File]::Exists($f)) { try { [System.IO.File]::Delete($f) } catch { } }
+                }
+            }
+            Write-Host '[task] 已清理该任务的无用分片与进度文件（资源不存在，无法续传）'
+        }
         try { Remove-Item -LiteralPath $lockFile -Force -ErrorAction SilentlyContinue } catch { }
         Write-Host ("[task] 结束 status={0} exit={1} {2}" -f $Status, $Code, $ErrorText)
         exit $Code

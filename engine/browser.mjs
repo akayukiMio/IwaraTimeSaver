@@ -85,13 +85,24 @@ export class Browser {
   }
 
   async _connect(startUrl) {
-    const list = await (await fetch(`http://127.0.0.1:${this.port}/json/list`)).json();
+    // 先摘掉旧 WS 的处理器再关：否则旧连接的迟到消息会和新一轮的 id 撞车
+    if (this.ws) {
+      try { this.ws.onmessage = null; this.ws.onerror = null; this.ws.close(); } catch { /* 忽略 */ }
+      this.ws = null;
+    }
+    const list = await (await fetch(`http://127.0.0.1:${this.port}/json/list`, { signal: AbortSignal.timeout(5000) })).json();
     let page = list.find((t) => t.type === 'page' && /iwara\.tv/.test(t.url || '')) || list.find((t) => t.type === 'page');
     if (!page) {
-      page = await (await fetch(`http://127.0.0.1:${this.port}/json/new?${encodeURIComponent(startUrl)}`, { method: 'PUT' })).json();
+      page = await (await fetch(`http://127.0.0.1:${this.port}/json/new?${encodeURIComponent(startUrl)}`, { method: 'PUT', signal: AbortSignal.timeout(8000) })).json();
     }
     this.ws = new WebSocket(page.webSocketDebuggerUrl);
-    await new Promise((res, rej) => { this.ws.onopen = res; this.ws.onerror = (e) => rej(new Error('CDP WebSocket 连接失败')); });
+    this._pending = new Map();
+    this._id = 0;
+    await new Promise((res, rej) => {
+      const timer = setTimeout(() => rej(new Error('CDP WebSocket 连接超时')), 10000);
+      this.ws.onopen = () => { clearTimeout(timer); res(); };
+      this.ws.onerror = () => { clearTimeout(timer); rej(new Error('CDP WebSocket 连接失败')); };
+    });
     this.ws.onmessage = (ev) => {
       let m; try { m = JSON.parse(ev.data); } catch { return; }
       if (m.id && this._pending?.has(m.id)) {
@@ -99,27 +110,26 @@ export class Browser {
         m.error ? p.rej(new Error(JSON.stringify(m.error))) : p.res(m.result);
       }
     };
-    this._pending = new Map();
-    this._id = 0;
-    await this._send('Runtime.enable', {});
-    await this._send('Page.enable', {});
+    await this._send('Runtime.enable', {}, 10000);
+    await this._send('Page.enable', {}, 10000);
     if (!/iwara\.tv/.test(page.url || '')) {
-      await this._send('Page.navigate', { url: startUrl });
+      await this._send('Page.navigate', { url: startUrl }, 15000);
     }
-    await this._waitCfPass();
+    await this._waitCfPass(30000);
   }
 
-  _send(method, params) {
+  _send(method, params, timeoutMs = 90000) {
     return new Promise((res, rej) => {
       const id = ++this._id;
       this._pending.set(id, { res, rej });
-      this.ws.send(JSON.stringify({ id, method, params }));
-      setTimeout(() => { if (this._pending.has(id)) { this._pending.delete(id); rej(new Error(`CDP 超时: ${method}`)); } }, 90000);
+      try { this.ws.send(JSON.stringify({ id, method, params })); }
+      catch (e) { this._pending.delete(id); return rej(e); }
+      setTimeout(() => { if (this._pending.has(id)) { this._pending.delete(id); rej(new Error(`CDP 超时: ${method}`)); } }, timeoutMs);
     });
   }
 
-  async evalJs(expression, { awaitPromise = true } = {}) {
-    const r = await this._send('Runtime.evaluate', { expression, awaitPromise, returnByValue: true });
+  async evalJs(expression, { awaitPromise = true, timeoutMs = 90000 } = {}) {
+    const r = await this._send('Runtime.evaluate', { expression, awaitPromise, returnByValue: true }, timeoutMs);
     if (r.exceptionDetails) throw new Error('页面内异常: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text));
     return r.result?.value;
   }
@@ -129,7 +139,7 @@ export class Browser {
     const deadline = Date.now() + maxMs;
     while (Date.now() < deadline) {
       let title = '';
-      try { title = String(await this.evalJs('document.title', { awaitPromise: false }) ?? ''); } catch { /* 导航中 */ }
+      try { title = String(await this.evalJs('document.title', { awaitPromise: false, timeoutMs: 5000 }) ?? ''); } catch { /* 导航中 */ }
       if (!/请稍候|Just a moment|moment|Attention Required|检查/i.test(title) && title) return true;
       await sleep(2500);
     }
@@ -256,16 +266,18 @@ export class Browser {
     }
   }
 
-  /** 活体探测：CDP WebSocket/JSON 全部超时就说明断了，返回 true */
-  async _probe(maxMs = 15000) {
-    const deadline = Date.now() + maxMs;
-    try {
-      const a = fetch(`http://127.0.0.1:${this.port}/json/version`, { signal: AbortSignal.timeout(deadline - Date.now()) }).catch(() => null);
+  /** 活体探测：CDP WebSocket/JSON 全部超时就说明断了，返回 true。
+   *  必须整体有界（默认 5 秒）：以前 evalJs 走 90 秒超时，页面一卡就让“解析中”挂两分钟。 */
+  async _probe(maxMs = 5000) {
+    const race = (async () => {
+      const a = fetch(`http://127.0.0.1:${this.port}/json/version`, { signal: AbortSignal.timeout(maxMs) }).catch(() => null);
       // 注意：evalJs 已经解包，返回的是原始值（1+1 直接得 2），不是 {result:{value:2}}
-      const b = this.evalJs('1+1', { awaitPromise: false }).catch(() => null);
+      const b = this.evalJs('1+1', { awaitPromise: false, timeoutMs: maxMs }).catch(() => null);
       const [ra, rb] = await Promise.all([a, b]);
       return !(ra && rb === 2);
-    } catch { return true; }
+    })();
+    const timeout = new Promise((r) => setTimeout(() => r(true), maxMs + 500));
+    try { return await Promise.race([race, timeout]); } catch { return true; }
   }
 
   async stop() {

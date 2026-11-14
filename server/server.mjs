@@ -255,20 +255,29 @@ function ensureLogin() {
 }
 
 async function apiFetch(method, urlOrPath, opts = {}) {
+  let lastErr = null;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const b = await getBrowser();
-    const t = await ensureLogin();
-    const r = await b.apiFetch(method, urlOrPath, { ...opts, token: t });
-    if (r.status === 401 && attempt === 0) {
-      // 令牌被吊销/过期：清掉重登一次（403 多数是 CF 挑战，重登没用）
-      log('system', '令牌被拒（401），重新获取后重试');
-      token = null;
-      setAuth('token', '令牌被拒，重新获取');
-      continue;
+    try {
+      const b = await getBrowser();
+      const t = await ensureLogin();
+      const r = await b.apiFetch(method, urlOrPath, { ...opts, token: t });
+      if (r.status === 401 && attempt === 0) {
+        // 令牌被吊销/过期：清掉重登一次（403 多数是 CF 挑战，重登没用）
+        log('system', '令牌被拒（401），重新获取后重试');
+        token = null;
+        setAuth('token', '令牌被拒，重新获取');
+        continue;
+      }
+      return r;
+    } catch (e) {
+      // CDP 通道卡死/断线：丢掉句柄重连一次（Edge 还在的话 Browser.start 会复用）
+      lastErr = e;
+      log('system', `API 通道异常（第 ${attempt + 1} 次）：${e.message}`);
+      browser = null;
+      await sleep(800);
     }
-    return r;
   }
-  return { status: 0, text: '', json: null };
+  throw lastErr || new Error('API 通道不可用');
 }
 
 // ---------------------------------------------------------------- 状态快照

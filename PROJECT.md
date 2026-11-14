@@ -114,6 +114,8 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 16. **`kill()` 不杀进程树**：`t.childProc.kill()` 只终止 `powershell.exe`，`Start-Process` 出来的 `segment.ps1` 变孤儿继续写同一批 `.part`。实测一次“删除重建”留下 4 个 task.ps1 + 32 个 segment.ps1，8 个 `.part` 全 0 字节、进度永远 0%。规则：停止/移除/重试/退出一律 `taskkill /PID <pid> /T /F`；`task.ps1` 必须持单实例锁。
 17. **ESM 里没有 `require`**：`browser.mjs` 的 `hideTaskbar()` 曾写 `require('child_process')`，每次抛 ReferenceError 又被 `try{}catch{}` 吞掉 → 窗口其实从没藏住。用文件顶部 `import { spawnSync }`。
 18. **`tokens.json` 只写不读 = 每次重启都要重登**：access token 只有 1 小时。启动时恢复 access、过期用 refresh token 换，才能“打开面板就能用”；`/api/relogin` 只应该是兜底。
+19. **CDP 调用必须整体有界**：`_send` 默认 90 秒、`_probe` 又等 `evalJs`，页面一卡就让“解析中”挂两分钟。探测必须在 5 秒内给出结论并重连；`_connect` 要先摘掉旧 WS 的 `onmessage` 再 close，否则旧连接的迟到消息会和新一轮 id 撞车。
+20. **404 是终止态，分片没有续传价值**：`task.ps1` 在 exit 6 时会顺手删掉本任务的 `.part`/`.prog`，避免输出目录里堆一堆 0 字节文件。需要保留现场时看 `logs/seg/<id>.seg<n>.log`。
 
 ## 7. 常见任务配方
 
