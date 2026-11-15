@@ -40,6 +40,10 @@ const OPEN_BROWSER = process.argv.includes('--open');
 const EXTRA_HOSTS = String(process.env.IWARA_WEB_HOSTS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const STALE_SEC = Math.max(30, Number(CFG.staleProgressSec) || 180);   // 进度文件多久没更新算僵死
 const LOG_MAX = Math.max(1, Number(CFG.logMaxMb) || 8) * 1024 * 1024; // 单个日志文件上限
+const COMPRESSOR_URL = String(CFG.compressorUrl || 'http://127.0.0.1:8765').replace(/\/+$/, '');
+const COMPRESSOR_DIR = String(CFG.compressorDir || path.resolve(ROOT, '..', 'video_compressor'));
+const AUTO_HANDOFF = CFG.autoHandoff !== false;
+const AUTO_START_COMPRESSOR = CFG.autoStartCompressor !== false;
 
 fs.mkdirSync(TASKDIR, { recursive: true });
 fs.mkdirSync(path.join(ROOT, 'logs'), { recursive: true });
@@ -57,6 +61,9 @@ const listeners = new Set();
 const outbox = [];
 let outboxTimer = null;
 const auth = { phase: 'idle', detail: '', since: Date.now() };
+let pipelineOnline = false;
+let pipelineFail = 0;
+let compressorLaunch = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -71,13 +78,14 @@ function saveQueue() {
   const keep = [...tasks.values()].map((t) => ({
     id: t.id, link: t.link, title: t.title, author: t.author, outFile: t.outFile,
     size: t.size, status: t.status, liked: t.liked, percent: t.percent, done: t.done,
-    speed: t.speed, addedAt: t.addedAt, error: t.error, tries: t.tries,
+    speed: t.speed, addedAt: t.addedAt, error: t.error, tries: t.tries, compress: t.compress,
   }));
   try { fs.writeFileSync(QUEUE, JSON.stringify(keep, null, 1), 'utf8'); } catch { /* 只影响重启后恢复 */ }
 }
 function loadQueue() {
   let arr = [];
   try { arr = JSON.parse(fs.readFileSync(QUEUE, 'utf8')); } catch { return; }
+  if (!Array.isArray(arr)) arr = arr ? [arr] : [];   // 手改/半截 json 时别让整个服务起不来
   for (const r of arr || []) {
     if (!r || !r.id) continue;
     // 服务重启后子进程已经没了：重新排队。分段进度在磁盘 .part 里，task.ps1 会从断点接着下。
@@ -280,6 +288,114 @@ async function apiFetch(method, urlOrPath, opts = {}) {
   throw lastErr || new Error('API 通道不可用');
 }
 
+// ---------------------------------------------------------------- 压缩流水线（ITS → compressor）
+async function compressorHealth() {
+  try {
+    const r = await fetch(`${COMPRESSOR_URL}/api/health`, { signal: AbortSignal.timeout(1500) });
+    return r.ok;
+  } catch { return false; }
+}
+
+// 压缩器没开就替用户拉起（run_web.py --no-browser，不抢浏览器焦点）
+async function ensureCompressor() {
+  if (await compressorHealth()) return true;
+  if (!AUTO_START_COMPRESSOR) return false;
+  if (!compressorLaunch) {
+    compressorLaunch = (async () => {
+      log('system', '压缩器未运行，正在自动启动…');
+      const runner = path.join(COMPRESSOR_DIR, 'web', 'run_web.py');
+      if (!fs.existsSync(runner)) throw new Error(`找不到压缩器启动脚本：${runner}`);
+      const venvPy = path.join(COMPRESSOR_DIR, 'web', 'backend', '.venv', 'Scripts', 'python.exe');
+      const exe = fs.existsSync(venvPy) ? venvPy : 'python';
+      const child = spawn(exe, [runner, '--no-browser'], { cwd: COMPRESSOR_DIR, detached: true, stdio: 'ignore', windowsHide: true });
+      child.unref();
+      for (let i = 0; i < 80; i++) { await sleep(500); if (await compressorHealth()) { log('system', '压缩器已启动'); return true; } }
+      throw new Error('压缩器启动超时（看 video_compressor/web/.run/backend.log）');
+    })().finally(() => { compressorLaunch = null; });
+  }
+  try { return await compressorLaunch; } catch (e) { log('system', e.message); return false; }
+}
+
+// 把一个已下载完成的任务交给压缩器；失败落 pending，由 retryHandoffs 定时补投
+async function handoffTask(t) {
+  if (!AUTO_HANDOFF || !t.outFile) return;
+  if (t.compress && t.compress.state && !['pending', 'failed'].includes(t.compress.state)) return;
+  const payload = {
+    job_id: t.id, paths: [t.outFile], source_dir: CFG.outDir,
+    size: t.done || t.total || t.size || 0,
+  };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      if (!(await ensureCompressor())) throw new Error('压缩器未启动，且自动拉起失败');
+      const r = await fetch(`${COMPRESSOR_URL}/api/handoff`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload), signal: AbortSignal.timeout(12000),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (r.status === 202 || r.status === 409) {
+        t.compress = { state: j.state || 'queued', position: j.position || 0 };
+        log(t.id, r.status === 202 ? `已交给压缩器（队列 #${j.position || '?'}）` : '压缩器已持有该任务（重复投递，忽略）');
+        pushState(); saveQueue();
+        return;
+      }
+      throw new Error(j.reason || j.error || `HTTP ${r.status}`);
+    } catch (e) {
+      log('system', `交付压缩器失败（${attempt + 1}/3）：${e.message}`);
+      await sleep(1500 * (attempt + 1));
+    }
+  }
+  t.compress = { state: 'pending', position: 0 };
+  log(t.id, '⚠ 压缩器不可用，已记为待交付，稍后自动重试');
+  pushState(); saveQueue();
+}
+
+// 每 5 秒同步压缩队列状态（单一真值源在压缩器那边）
+async function syncPipeline() {
+  if (!AUTO_HANDOFF) return;
+  try {
+    const r = await fetch(`${COMPRESSOR_URL}/api/handoff`, { signal: AbortSignal.timeout(2500) });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    if (!pipelineOnline) log('system', '压缩器通道已连接');
+    pipelineOnline = true; pipelineFail = 0;
+    const byId = new Map((j.jobs || []).map((x) => [x.job_id, x]));
+    let changed = false;
+    for (const t of tasks.values()) {
+      const x = byId.get(t.id);
+      if (!x) continue;
+      const first = Array.isArray(x.result) && x.result[0] ? x.result[0] : null;
+      const next = {
+        state: x.state === 'running' ? 'compressing' : x.state,
+        position: x.position || 0,
+        output: first ? (first.archive_path || first.output_path || '') : '',
+        saved: first && first.status === 'done' ? Math.max(0, (first.size || 0) - (first.output_size || 0)) : 0,
+        action: first ? (first.source_action || '') : '',
+        note: x.error || (first ? (first.error_msg || '') : ''),
+      };
+      if (JSON.stringify(t.compress) !== JSON.stringify(next)) {
+        t.compress = next; changed = true;
+        if (next.state === 'done') log(t.id, `压缩流程结束（${next.action === 'deleted' ? '已删源' : next.action === 'moved' ? '原片已归档' : '完成'}）`);
+        if (next.state === 'failed') log(t.id, `压缩失败：${next.note || '未知'}`);
+      }
+    }
+    if (changed) { pushState(); saveQueue(); }
+  } catch (e) {
+    pipelineOnline = false;
+    if (++pipelineFail === 1) log('system', `压缩器离线（${COMPRESSOR_URL}）：${e.message}`);
+    for (const t of tasks.values()) {
+      if (t.compress && (t.compress.state === 'queued' || t.compress.state === 'compressing')) t.compress.state = 'pending';
+    }
+  }
+}
+
+// 压缩器离线/重启期间没投递成功的任务，定时补投
+function retryHandoffs() {
+  if (!AUTO_HANDOFF) return;
+  for (const t of tasks.values()) {
+    if (t.status === 'done' && t.compress?.state === 'pending') handoffTask(t).catch(() => {});
+  }
+}
+
 // ---------------------------------------------------------------- 状态快照
 function emit(ev, data) {
   outbox.push({ ev, data });
@@ -299,12 +415,22 @@ function summary() {
     if (t.total) { done += t.done || 0; total += t.total; }
     if (t.status === 'downloading' || t.status === 'resolving') { running++; speed += t.speed || 0; }
   }
+  const pipe = { online: pipelineOnline, queued: 0, compressing: 0, archived: 0, moved: 0, failed: 0, pending: 0 };
+  for (const t of tasks.values()) {
+    const s = t.compress?.state;
+    if (s === 'queued') pipe.queued++;
+    else if (s === 'compressing') pipe.compressing++;
+    else if (s === 'pending') pipe.pending++;
+    else if (s === 'failed') pipe.failed++;
+    else if (s === 'done') { if (t.compress?.action === 'moved') pipe.moved++; else pipe.archived++; }
+  }
   return {
     tasks: tasks.size, running, speed: Math.round(speed * 100) / 100,
     doneMb: Math.round(done / 1048576 * 10) / 10, totalMb: Math.round(total / 1048576 * 10) / 10,
     percent: total ? Math.round(done * 1000 / total) / 10 : 0,
     loggedIn: !!token, browserUp: !!browser || !!browserStarting,
     auth: { phase: auth.phase, detail: auth.detail, since: auth.since, elapsed: Math.round((Date.now() - auth.since) / 1000) },
+    pipeline: pipe, compressorUrl: COMPRESSOR_URL, autoHandoff: AUTO_HANDOFF,
     maxTasks: CFG.maxTasks || 2, segments: CFG.segmentsPerFile || 8,
     outDir: CFG.outDir, quality: CFG.quality || 'Source',
   };
@@ -316,6 +442,7 @@ function snapshot() {
       id: t.id, link: t.link, title: t.title, author: t.author, status: t.status, liked: t.liked,
       percent: t.percent || 0, done: t.done || 0, total: t.total || t.size || 0, speed: t.speed || 0,
       outFile: t.outFile, error: t.error, segAlive: t.segAlive || 0, tries: t.tries || 0, addedAt: t.addedAt,
+      compress: t.compress || null,
     })),
   };
 }
@@ -472,7 +599,9 @@ async function onTaskExit(t, code) {
     t.status = 'done'; t.percent = 100; t.speed = 0; t.error = '';
     if (!t.done && t.total) t.done = t.total;      // 不补这一步，已完成行会显示 0 / 275 MB
     log(t.id, '✅ 下载完成');
-    pushState(); saveQueue(); return;
+    pushState(); saveQueue();
+    if (AUTO_HANDOFF) handoffTask(t).catch((e) => log(t.id, '交付压缩器异常: ' + e.message));
+    return;
   }
   if (t.status === 'stopped' || code === 5) { t.status = 'stopped'; log(t.id, '已停止'); pushState(); saveQueue(); return; }
   if (code === 6) {
@@ -694,6 +823,16 @@ setInterval(() => { for (const res of listeners) { try { res.write(': ping\n\n')
 setInterval(pollProgress, 1000).unref();
 setInterval(pushState, 3000).unref();
 schedTimer = setInterval(schedule, 2500);
+if (AUTO_HANDOFF) {
+  setTimeout(syncPipeline, 1200);
+  setInterval(syncPipeline, 5000).unref();
+  setInterval(retryHandoffs, 30000).unref();
+}
+// 定时重新隐藏：用户点任务栏把窗口叫回来、或 Edge 新开窗口时，2 分钟内收回去并清掉“请求注意”闪烁
+setInterval(() => {
+  if (!browser) return;
+  try { browser.hideTaskbar().catch(() => {}); } catch { /* 忽略 */ }
+}, 120000).unref();
 
 // ---------------------------------------------------------------- 单实例
 function lockPath(port) { return path.join(STATE, `web_${port}.lock`); }
@@ -731,6 +870,15 @@ async function main() {
     const killed = sweepOrphans();
     const pruned = sweepSegLogs(7);
     const restored = restoreToken();
+    // 重启恢复：下载已完成但还没交给压缩器的任务，补投一次
+    if (AUTO_HANDOFF) {
+      for (const t of tasks.values()) {
+        if (t.status === 'done' && t.outFile && (!t.compress || !t.compress.state)) {
+          t.compress = { state: 'pending', position: 0 };
+          handoffTask(t).catch(() => {});
+        }
+      }
+    }
     console.log('');
     console.log('  iwaraMachine · 面板已启动');
     console.log(`  地址      http://${HOST}:${PORT}/   (pid ${process.pid})`);

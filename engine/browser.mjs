@@ -62,7 +62,15 @@ export class Browser {
       const c = spawn(exe, [
         `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`,
         '--no-first-run', '--no-default-browser-check', '--disable-gpu',
-        '--window-position=-32000,-32000', '--window-size=1280,900', 'about:blank',
+        '--window-position=-32000,-32000', '--window-size=1280,900',
+        // 后台页面不降频/不因隐藏而挂起：窗口会被 SW_HIDE 完全藏起来
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--disable-features=CalculateNativeWinOcclusion',
+        // 站点通知会点亮/闪烁任务栏图标，自动化用不到
+        '--disable-notifications',
+        'about:blank',
       ], { detached: true, stdio: 'ignore' });
       c.unref();
       for (let i = 0; i < 60; i++) { await sleep(500); if (await Browser.ping(port)) return c; }
@@ -108,6 +116,11 @@ export class Browser {
       if (m.id && this._pending?.has(m.id)) {
         const p = this._pending.get(m.id); this._pending.delete(m.id);
         m.error ? p.rej(new Error(JSON.stringify(m.error))) : p.res(m.result);
+        return;
+      }
+      // 页面弹 alert/confirm 会让隐藏窗口“请求注意”，任务栏图标一直闪红：自动接受掉
+      if (m.method === 'Page.javascriptDialogOpening') {
+        try { this._send('Page.handleJavaScriptDialog', { accept: true }, 5000).catch(() => {}); } catch { /* 忽略 */ }
       }
     };
     await this._send('Runtime.enable', {}, 10000);
@@ -192,6 +205,9 @@ export class Browser {
       throw new Error(`拿到 refresh token，但 /user/token 没给 accessToken（HTTP ${t.status} ${String(t.text).slice(0, 120)}）`);
     }
     say_login_fail(direct);
+    if (direct.status === 0) {
+      throw new Error('页面内请求失败（HTTP 0）：多半是本机代理没开或端口变了（预期 127.0.0.1:7897），检查代理后再点「重新登录」');
+    }
     if (!formFallback) {
       throw new Error(`页面内直连登录失败（HTTP ${direct.status} ${String(direct.text || '').slice(0, 120)}）；` +
         '表单回退默认关闭（它会导航共享页面、打断并发任务），确需启用请把 config.local.json 的 formLoginFallback 设为 true');

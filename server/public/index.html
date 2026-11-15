@@ -19,6 +19,7 @@
       <button class="btn" id="btnStart">继续队列</button>
       <button class="btn danger" id="btnStop">停止全部</button>
       <button class="ghost" id="btnRelogin">重新登录</button>
+      <button class="ghost" id="btnCompressor">压缩器</button>
       <button class="ghost" id="btnOut">输出目录</button>
       <button class="ghost" id="btnTheme">深色/浅色</button>
     </div>
@@ -58,6 +59,9 @@
     </div>
     <div class="dock-body"><pre class="log" id="log"><span class="ph">日志会实时出现在这里（服务端 60ms 攒批下发）。</span></pre></div>
   </section>
+</div>
+<div class="drop-mask" id="dropMask">
+  <div class="drop-card">松手加入下载队列<br><small>支持 iwara 视频卡片 / 地址栏链接，多个一起拖也行</small></div>
 </div>
 <div class="toasts" id="toasts"></div>
 <script src="app.js" type="module"></script>

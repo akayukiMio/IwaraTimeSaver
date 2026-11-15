@@ -135,6 +135,21 @@ textarea:focus { border-color: color-mix(in srgb, var(--a) 50%, var(--line2)); o
 .toast.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
 @keyframes up { from { opacity: 0; transform: translateY(7px); } to { opacity: 1; } }
 
+/* 压缩流水线状态徽标 */
+.badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+.badge.err { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+.badge.active { color: var(--b); border-color: color-mix(in srgb, var(--b) 45%, transparent); }
+.badge.dim { color: var(--faint); }
+
+/* 整页拖拽接收层 */
+.drop-mask { position: fixed; inset: 0; z-index: 120; display: none; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--bg) 72%, transparent); backdrop-filter: blur(2px); pointer-events: none; }
+.drop-mask.show { display: flex; }
+.drop-card { padding: 26px 38px; border-radius: 18px; border: 2px dashed color-mix(in srgb, var(--a) 60%, transparent);
+  background: var(--bg2); color: var(--text); font-size: 16px; text-align: center; line-height: 1.8;
+  box-shadow: 0 24px 60px -30px #000; }
+.drop-card small { color: var(--muted); font-size: 12.5px; }
+
 @media (max-width: 880px) {
   .adder { grid-template-columns: minmax(0,1fr); }
   .top { padding: 10px 14px; }

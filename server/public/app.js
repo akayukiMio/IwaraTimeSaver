@@ -39,6 +39,27 @@ function authBusy() {
   const ph = meta.auth?.phase || 'idle';
   return ph === 'starting' || ph === 'cf' || ph === 'token' || ph === 'login';
 }
+// 下载 → 压缩流水线的状态文案（与 compressor 的 state 一一对应）
+function compressText(c) {
+  if (!c || !c.state) return '';
+  switch (c.state) {
+    case 'pending': return '待交付压缩器';
+    case 'queued': return c.position ? `待压缩（队列 #${c.position}）` : '待压缩';
+    case 'compressing': return '压缩中';
+    case 'done': return c.action === 'moved' ? '原片已归档（没压动）' : `已压缩${c.saved ? `，省 ${MB(c.saved)} MB` : ''}`;
+    case 'failed': return `压缩失败${c.note ? '：' + c.note : ''}`;
+    case 'canceled': return '压缩已取消';
+    default: return c.state;
+  }
+}
+function compressClass(c) {
+  if (!c || !c.state) return '';
+  if (c.state === 'failed') return 'err';
+  if (c.state === 'done') return 'ok';
+  if (c.state === 'compressing') return 'active';
+  return 'dim';
+}
+
 function renderChips() {
   const c = [];
   const a = meta.auth || {};
@@ -46,6 +67,8 @@ function renderChips() {
   const authText = busy
     ? `${AUTH_CN[a.phase] || a.phase}… ${a.elapsed ?? 0}s`
     : (meta.loggedIn ? '已登录' : (AUTH_CN[a.phase] || a.phase || '未登录'));
+  const pl = meta.pipeline || {};
+  const pipeText = `${pl.online ? '在线' : '离线'} · 待压 ${(pl.queued || 0) + (pl.pending || 0)} · 压缩中 ${pl.compressing || 0} · 已归档 ${(pl.archived || 0) + (pl.moved || 0)}${pl.failed ? ` · 失败 ${pl.failed}` : ''}`;
   c.push(`<span class="chip">档位 <b>${meta.quality || '-'}</b></span>`);
   c.push(`<span class="chip">并发 <b>${meta.maxTasks || '-'} 文件 × ${meta.segments || '-'} 段</b></span>`);
   c.push(`<span class="chip">聚合速度 <b>${(meta.speed || 0).toFixed(2)} MB/s</b></span>`);
@@ -53,6 +76,7 @@ function renderChips() {
   c.push(`<span class="chip${meta.loggedIn ? '' : ' warn'}" title="${esc(a.detail || '')}">登录 <b>${esc(authText)}</b></span>`);
   const browserText = meta.browserUp ? '在线' : (meta.loggedIn ? '按需启动' : '未启动');
   c.push(`<span class="chip${meta.browserUp ? '' : ' warn'}">浏览器通道 <b>${browserText}</b></span>`);
+  c.push(`<span class="chip${pl.online ? '' : ' warn'}" title="${esc(meta.compressorUrl || '')}">压缩器 <b>${esc(pipeText)}</b></span>`);
   $('#chips').innerHTML = c.join('');
   $('#btnRelogin').disabled = busy;
   if (meta.segments) $('#segTip').textContent = meta.segments;
@@ -72,6 +96,8 @@ function renderRows() {
       r.total ? `${MB(r.done || 0)}/${MB(r.total)} MB` : '',
       active && r.speed != null ? `${r.speed.toFixed ? r.speed.toFixed(2) : r.speed} MB/s` : '',
       active && r.segAlive ? `在跑段 ${r.segAlive}` : '',
+      compressText(r.compress),
+      r.compress && r.compress.output ? `→ ${r.compress.output}` : '',
       r.error ? `⚠ ${r.error}` : '',
       r.outFile ? `→ ${r.outFile}` : '',
     ].filter(Boolean).join('   ·   ');
@@ -79,6 +105,7 @@ function renderRows() {
       <div class="r-title">${esc(r.title || r.id)}</div>
       <div class="r-right">
         ${r.liked ? '<span class="badge liked">已赞</span>' : ''}
+        ${r.compress && r.compress.state ? `<span class="badge ${compressClass(r.compress)}">${esc(compressText(r.compress))}</span>` : ''}
         <span class="badge ${r.status}">${STATUS_CN[r.status] || r.status}</span>
         <span class="pct">${r.total ? pct.toFixed(1) + '%' : (r.done ? MB(r.done) + 'MB' : '-')}</span>
         <button class="ghost" data-retry="${r.id}">重试</button>
@@ -206,4 +233,78 @@ $('#btnTheme').addEventListener('click', () => {
 if (localStorage.getItem('iw-theme')) document.documentElement.dataset.theme = localStorage.getItem('iw-theme');
 $('#links').addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) $('#btnEnqueue').click();
+});
+$('#btnCompressor').addEventListener('click', () => {
+  window.open(meta.compressorUrl || 'http://127.0.0.1:8765', '_blank');
+});
+
+// ------------------------------------------------------------ 拖拽 / 粘贴入队
+// 从 iwara 拖视频卡片或地址栏链接进来，DataTransfer 里通常是 text/uri-list + text/html；
+// 只拖缩略图可能只有图片地址，所以这里三种格式都解析，解析不出就给明确提示。
+function idsFromText(text) {
+  const ids = [];
+  for (const line of String(text || '').split(/[\r\n]+/)) {
+    const s = line.trim();
+    if (!s || s.startsWith('#')) continue;
+    const m = /\/video\/([A-Za-z0-9]{6,24})/.exec(s);
+    if (m) ids.push(m[1]);
+    else if (/^[A-Za-z0-9]{6,24}$/.test(s)) ids.push(s);
+  }
+  return ids;
+}
+function idsFromHtml(html) {
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const out = [];
+    for (const a of doc.querySelectorAll('a[href]')) out.push(...idsFromText(a.getAttribute('href')));
+    return out;
+  } catch { return []; }
+}
+function extractDropped(dt) {
+  const ids = new Set();
+  for (const id of idsFromText(dt.getData('text/uri-list'))) ids.add(id);
+  for (const id of idsFromText(dt.getData('text/plain'))) ids.add(id);
+  const html = dt.getData('text/html');
+  if (html) for (const id of idsFromHtml(html)) ids.add(id);
+  return [...ids];
+}
+window.__itsExtract = extractDropped;   // 便于在控制台/自动化里验证解析
+window.__itsIds = idsFromText;
+
+async function enqueueIds(ids) {
+  const links = ids.map((id) => `https://www.iwara.tv/video/${id}`);
+  const r = await api('/api/enqueue', { links });
+  toast(r.added ? `已加入 ${r.added} 个任务` : '没有新任务（可能都已完成或已存在）', 'ok');
+}
+
+let dragDepth = 0;
+const dropMask = $('#dropMask');
+document.addEventListener('dragenter', (e) => {
+  if (!e.dataTransfer) return;
+  const types = Array.from(e.dataTransfer.types || []);
+  if (!types.some((t) => ['text/uri-list', 'text/plain', 'text/html', 'Files'].includes(t))) return;
+  dragDepth++;
+  dropMask.classList.add('show');
+});
+document.addEventListener('dragleave', () => {
+  if (--dragDepth <= 0) { dragDepth = 0; dropMask.classList.remove('show'); }
+});
+document.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+});
+document.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  dragDepth = 0; dropMask.classList.remove('show');
+  const ids = extractDropped(e.dataTransfer);
+  if (!ids.length) { toast('没识别到 iwara 视频链接：请拖视频卡片/标题，别只拖缩略图', 'err'); return; }
+  try { await enqueueIds(ids); } catch (err) { toast(err.message, 'err'); }
+});
+document.addEventListener('paste', async (e) => {
+  const t = e.target;
+  if (t && (t.tagName === 'TEXTAREA' || t.tagName === 'INPUT')) return; // 输入框里保留默认粘贴
+  const ids = idsFromText(e.clipboardData?.getData('text') || '');
+  if (!ids.length) return;
+  e.preventDefault();
+  try { await enqueueIds(ids); } catch (err) { toast(err.message, 'err'); }
 });

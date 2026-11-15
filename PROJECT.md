@@ -63,6 +63,7 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 ### `config.local.json`
 `email` `password` `apiBase` `outDir` `quality`(Source) `maxTasks`(文件级并发) `segmentsPerFile`(段数) `segmentStallSec`(卡死阈值) `webPort` `cdpPort` `likeBeforeDownload`
 `warmBrowserOnStart`(启动预热登录，默认 true) `formLoginFallback`(表单登录回退，默认 false) `staleProgressSec`(进度多久没更新算僵死，默认 180) `logMaxMb`(单日志上限，默认 8)
+`compressorUrl`(压缩器地址，默认 http://127.0.0.1:8765) `compressorDir`(video_compressor 绝对路径) `autoHandoff`(下载完成自动交付压缩，默认 true) `autoStartCompressor`(压缩器没开就代拉起，默认 true)
 
 ### `engine/browser.mjs`
 - `Browser.start({profileDir,port})`：找不到可调试实例就起一个；等 CDP 端口就绪；导航到 iwara 并轮询标题直到过 CF
@@ -78,6 +79,8 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 - 直链自愈：`task.ps1` 退出码 3 → 重新解析拿新签名 URL → 重跑（最多 3 次）
 - **断线自愈**：`ensureLogin()` 内置 `_probe()` 前置探测 + 两次重试，CDP 死了自动杀浏览器重拉
 - 接口：`/api/state` `/api/events`(SSE) `/api/enqueue` `/api/start` `/api/stop` `/api/retry` `/api/remove` `/api/relogin` `/api/local` `/api/shutdown` `/api/whoami`
+- **压缩流水线**：任务 `done` → `POST {compressorUrl}/api/handoff`（幂等键=视频ID）→ 每 5s 拉 `/api/handoff` 合并状态；压缩器离线时置 `pending` 并每 30s 补投；`autoStartCompressor` 时用 `video_compressor/web/run_web.py --no-browser` 代拉起
+- 单一真值源：压缩状态以压缩器队列为准，ITS 只展示；结果写回任务的 `compress` 字段（`pending/queued/compressing/done/failed` + `action=deleted|moved`）
 - 只绑 `127.0.0.1`，端口固定不顺延 + `state/web_<port>.lock` + whoami 探活复用
 
 ### `engine/task.ps1` / `engine/segment.ps1`
@@ -116,6 +119,7 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 18. **`tokens.json` 只写不读 = 每次重启都要重登**：access token 只有 1 小时。启动时恢复 access、过期用 refresh token 换，才能“打开面板就能用”；`/api/relogin` 只应该是兜底。
 19. **CDP 调用必须整体有界**：`_send` 默认 90 秒、`_probe` 又等 `evalJs`，页面一卡就让“解析中”挂两分钟。探测必须在 5 秒内给出结论并重连；`_connect` 要先摘掉旧 WS 的 `onmessage` 再 close，否则旧连接的迟到消息会和新一轮 id 撞车。
 20. **404 是终止态，分片没有续传价值**：`task.ps1` 在 exit 6 时会顺手删掉本任务的 `.part`/`.prog`，避免输出目录里堆一堆 0 字节文件。需要保留现场时看 `logs/seg/<id>.seg<n>.log`。
+21. **Win11 任务栏闪红**：只给窗口加 `WS_EX_TOOLWINDOW` 不够——离屏窗口仍可能被算进 Edge 分组，网页弹 alert/通知时任务栏图标会一直闪“请求注意”，点它（窗口在屏幕外）也消不掉。`hide_window.ps1` 现在同时做：`ShowWindow(SW_HIDE)` 整窗隐藏 + `ITaskbarList::DeleteTab` 删任务栏按钮 + `FlashWindow(FALSE)` 停闪；Edge 启动参数加 `--disable-notifications` 并关掉后台节流；CDP 侧自动 `Page.handleJavaScriptDialog` 接收弹窗；`server.mjs` 每 2 分钟重新隐藏一次（用户点任务栏把窗口叫回来也能收回去）。隐藏后 `document.visibilityState=hidden`，但 CDP 求值和定时器实测正常（1s 定时器 ~1.0s 触发）。
 
 ## 7. 常见任务配方
 
@@ -149,6 +153,8 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 - 登录体验：启动恢复 `tokens.json` → 预热登录 → 面板直接显示“已登录”；`/api/relogin` 立即 202，进度在顶部芯片按阶段+秒数走
 - 卡死防护：单实例锁、`taskkill /T` 回收进程树、`staleProgressSec` 僵死检测、看门狗总预算、404 直接失败（实测 2.6s）
 - 磁盘：`logs\panel.log` 达 `logMaxMb` 自动轮转；`logs\seg\` 保留 7 天；状态/日志/Edge profile 全在项目目录（E 盘），不占 C 盘
+- 工作流整合（2026-11-15）：拖拽/粘贴入队 → 下载完成自动交付 video_compressor（含代拉起）→ 压小则删源、没压动则把原片搬进存储目录，`iwara-out` 结束即空
+- 交接实测：压缩器离线时 ITS 4 秒内拉起并投递；产物写 `F:\fumofumo_4`、源进回收站；重复投递返回 409 不重复压
 - 进度条修复：`pollProgress()` 对 `status === 'done'` 的任务也回读 `total`，CDN 实到写回后进度条到 100%
 - `config.local.json` 的全部字段均已接线；面板日志落盘 `logs\panel.log` 已验证
 - 桌面快捷方式：`start.vbs`（无窗口后台启动）+ `iwaraMachine.ico`（多尺寸标准 ICO）
