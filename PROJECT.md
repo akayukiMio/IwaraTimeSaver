@@ -56,7 +56,38 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8811/api/enqueue `
 Invoke-RestMethod http://127.0.0.1:8811/api/state        # 看队列与进度
 Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进度保留，可续）
 ```
+更省事的两种入队方式（面板前端）：
+
+- 从 iwara 把**视频卡片/标题**拖到面板任意位置，松手即入队（多选一起拖也行）；
+- 复制视频链接后，在页面任意位置 `Ctrl+V` 直接入队。
+
+下载完成后会自动交给 video_compressor 压缩，见 §3.1。
 首次启动会在第一个任务时拉起一个**离屏 Edge 窗口**（`--window-position=-32000,-32000`）用于过 Cloudflare，之后一直复用；那个窗口不要手动关，关了会自动重开。面板启动会自动预热登录（`warmBrowserOnStart`），并优先复用 `state/tokens.json` 里的令牌——正常情况下打开面板就是“已登录”，不需要再点「重新登录」。
+
+### 3.1 下载 → 压缩 → 归档（自动交接）
+
+```
+iwara 卡片/链接
+   │ 拖拽 / Ctrl+V
+   ▼
+ITS 8811     解析 → 点赞 → 8 段下载
+   │ 任务 done
+   ▼ POST http://127.0.0.1:8765/api/handoff
+compressor 8765   持久队列 → 串行压缩
+   ├─ 压小：产物进 F:\\fumofumo_4，源进回收站
+   ├─ 没压动：产物丢弃，源搬到 F:\\fumofumo_4（平铺）
+   └─ 出错：源留在 iwara-out，标 failed 等重试
+   ▼
+ITS 每 5s 拉 /api/handoff，任务行显示 待压/压缩中/已归档/失败
+```
+
+- `iwara-out` 在流程结束后只应剩下“正在下载”或“压缩失败”的文件；
+- 压缩器没开时 ITS 自动用 `video_compressor\web\run_web.py --no-browser` 拉起（不抢浏览器焦点）；
+- 交接幂等键 = 视频 ID，重复投递返回 409，不会压两遍；
+- 压缩状态以压缩器队列为唯一真值源，ITS 只负责投递与展示；
+- ITS 重启时会把“已下载但没交付”的任务补投一次。
+
+配置项：`compressorUrl` / `compressorDir` / `autoHandoff` / `autoStartCompressor`。
 
 ## 4. 模块职责与关键参数
 
@@ -132,6 +163,10 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 | 令牌失效/被登出 | 面板点「重新登录」，或 `POST /api/relogin`（立即 202，进度看顶部芯片） |
 | 日志占空间 | `logs\panel.log` 超过 `logMaxMb`(默认 8MB) 自动轮转为 `panel.log.1`；`logs\seg\` 只保留 7 天，成功任务的段日志即时删除 |
 | 清掉某个任务的残留分片 | 删 `E:\administrator\iwara-out\*<视频ID>*.part*`（先确保该任务没在跑） |
+| 关掉自动压缩 | `autoHandoff=false` 后重启面板；下载完只留在 `iwara-out`，不再投递 |
+| 压缩器离线/没启动 | 正常会自动拉起；仍失败看 `video_compressor\web\.run\backend.log`，或手动 `python web\run_web.py --no-browser` |
+| 查看/取消压缩队列 | `GET http://127.0.0.1:8765/api/handoff`；`POST http://127.0.0.1:8765/api/handoff/<job_id>/cancel` |
+| 手动补交一个已完成文件 | `POST http://127.0.0.1:8765/api/handoff`，body `{"job_id":"<视频ID>","paths":["<mp4>"],"source_dir":"E:\\administrator\\iwara-out"}` |
 | CF 一直过不去 | 删 `state/edgeprofile/` 后重启，第一次手动在弹出的 Edge 窗口里过一次 |
 | 改完 .ps1 的校验 | `Get-ChildItem -Recurse -Filter *.ps1 \| % { [IO.File]::WriteAllText($_.FullName, [IO.File]::ReadAllText($_.FullName, (New-Object Text.UTF8Encoding $false)), (New-Object Text.UTF8Encoding $true)) }` 补 BOM，再用 `Parser::ParseFile` 查语法 |
 | 单视频手工验证 | `powershell -File engine\task.ps1 -TaskFile state\tasks\<id>.json` |
@@ -142,8 +177,9 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 - Node v20+（实测 v24；只用内置模块 + 全局 WebSocket，**无 npm 依赖**）
 - Microsoft Edge 或 Chrome（过 Cloudflare 用，路径自动探测）
 - `ffmpeg`/`ffprobe`（可选，仅用于校验产物完整性）
+- `video_compressor`（可选：自动压缩流水线；不装就把 `autoHandoff` 设为 false）
 
-## 9. 当前状态基线（2026-10-08）
+## 9. 当前状态基线（2026-11-15）
 
 - 端到端已跑通 25 个视频，其中 12 个 CDN 实际字节数小于 API 声称 size（整体比例 80.5%），全部按实到合并成功
 - 点赞已真实生效多次；后续任务对已赞视频会跳过（日志"已经赞过了，跳过"）
@@ -162,4 +198,5 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8811/api/stop   # 停止（进�
 ## 10. 版本管理与对外边界
 
 - 与 `beidewu` 画廊工具链的关系：**只共享经验，不共享代码**。本项目复用了它的三条结论（.NET 走系统代理、状态以磁盘为准、SSE/DOM 攒批），但目录、配置、状态、进程完全独立。
+- 与 `video_compressor` 的关系：**契约式对接**，不合并代码库。ITS 只在任务完成时 `POST /api/handoff`，并用 `GET /api/handoff` 同步状态；压缩器负责排队、压缩、删源/搬原片。两边各自独立仓库、独立进程。
 - GitHub 仓库：`https://github.com/akayukiMio/IwaraTimeSaver.git`

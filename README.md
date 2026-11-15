@@ -21,13 +21,35 @@ iwara 视频批量下载工具：自动点赞 → 解析 Source 原片 → 分�
 1. 克隆仓库
 2. 复制 `config.local.json.example` → `config.local.json`，填入 iwara 账号密码
 3. 双击 `start.vbs`（无窗口后台启动）或 `start.cmd`（调试模式，会出命令行窗口）
-4. 浏览器自动打开 `http://127.0.0.1:8811/`，粘贴视频链接 → 加入队列
+4. 浏览器自动打开 `http://127.0.0.1:8811/`，把 iwara 视频卡片拖进页面（或复制链接后 `Ctrl+V`）
+
+## 工作流
+
+```
+iwara 卡片/链接 ──拖拽/Ctrl+V──▶ ITS 8811：点赞 → 解析 → 8 段下载
+                                      │ 下载完成（done）
+                                      ▼
+                          video_compressor 8765：排队 → 压缩
+                                      │
+                     ┌────────────────┴────────────────┐
+                压小了                              没压动/出错
+        产物进存储目录、源删进回收站         产物丢弃、源原样搬进存储目录（出错则保留待重试）
+                                      │
+                                      ▼
+                        ITS 面板显示 待压/压缩中/已归档/失败
+```
+
+- 压缩器没启动时 ITS 会自动拉起（`run_web.py --no-browser`），不需要先打开 8765；
+- `iwara-out` 在流程结束后只剩“下载中”或“压缩失败”的文件；
+- 压缩参数在 video_compressor 的面板里改，ITS 只读展示；
+- 不想自动压缩就把 `config.local.json` 的 `autoHandoff` 设为 `false`。
 
 ## 技术栈
 
 - **Node.js**（v20+，零 npm 依赖）：面板服务 + Edge CDP 通道
 - **PowerShell 5.1** + **.NET**：CDN 分段下载（走系统代理）
 - **Microsoft Edge**：过 Cloudflare 挑战
+- **video_compressor**（可选，独立仓库）：接收交接并压缩，契约式对接不共用代码
 
 ## 项目结构
 
