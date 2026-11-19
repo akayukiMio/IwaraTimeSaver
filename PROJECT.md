@@ -93,7 +93,7 @@ ITS 每 5s 拉 /api/handoff，任务行显示 待压/压缩中/已归档/失败
 
 ### `config.local.json`
 `email` `password` `apiBase` `outDir` `quality`(Source) `maxTasks`(文件级并发) `segmentsPerFile`(段数) `segmentStallSec`(卡死阈值) `webPort` `cdpPort` `likeBeforeDownload`
-`warmBrowserOnStart`(启动预热登录，默认 true) `formLoginFallback`(表单登录回退，默认 false) `staleProgressSec`(进度多久没更新算僵死，默认 180) `logMaxMb`(单日志上限，默认 8)
+`warmBrowserOnStart`(启动预热登录，默认 true) `formLoginFallback`(表单登录回退，默认 false) `staleProgressSec`(进度多久没更新算僵死，默认 180) `apiFetchTimeoutMs`(页面内 fetch 硬超时，默认 30000) `logMaxMb`(单日志上限，默认 8)
 `compressorUrl`(压缩器地址，默认 http://127.0.0.1:8765) `compressorDir`(video_compressor 绝对路径) `autoHandoff`(下载完成自动交付压缩，默认 true) `autoStartCompressor`(压缩器没开就代拉起，默认 true)
 
 ### `engine/browser.mjs`
@@ -108,7 +108,7 @@ ITS 每 5s 拉 /api/handoff，任务行显示 待压/压缩中/已归档/失败
 - 调度：`maxTasks` 个文件级并发；每个任务 `spawn powershell -File engine/task.ps1 -TaskFile ...`
 - 进度：每秒回读 `state/tasks/<id>.json` → 合并进内存 → 3s 一次 SSE 广播（**批量下发，不逐行**）
 - 直链自愈：`task.ps1` 退出码 3 → 重新解析拿新签名 URL → 重跑（最多 3 次）
-- **断线自愈**：`ensureLogin()` 内置 `_probe()` 前置探测 + 两次重试，CDP 死了自动杀浏览器重拉
+- **断线自愈**：`ensureLogin()` 内置 `_probe()` 前置探测 + 两次重试；`apiFetch` 页面内 `fetch` 带 `apiFetchTimeoutMs` 硬超时，超时/CDP 异常一律 `hardRestartBrowser()`——按 CDP 端口 `taskkill /T /F` 杀掉整个浏览器进程树再重拉（复用只 ping 端口会卡在同一个病态实例上，见 §6 坑 22）
 - 接口：`/api/state` `/api/events`(SSE) `/api/enqueue` `/api/start` `/api/stop` `/api/retry` `/api/remove` `/api/relogin` `/api/local` `/api/shutdown` `/api/whoami`
 - **压缩流水线**：任务 `done` → `POST {compressorUrl}/api/handoff`（幂等键=视频ID）→ 每 5s 拉 `/api/handoff` 合并状态；压缩器离线时置 `pending` 并每 30s 补投；`autoStartCompressor` 时用 `video_compressor/web/run_web.py --no-browser` 代拉起
 - 单一真值源：压缩状态以压缩器队列为准，ITS 只展示；结果写回任务的 `compress` 字段（`pending/queued/compressing/done/failed` + `action=deleted|moved`）
@@ -151,6 +151,8 @@ ITS 每 5s 拉 /api/handoff，任务行显示 待压/压缩中/已归档/失败
 19. **CDP 调用必须整体有界**：`_send` 默认 90 秒、`_probe` 又等 `evalJs`，页面一卡就让“解析中”挂两分钟。探测必须在 5 秒内给出结论并重连；`_connect` 要先摘掉旧 WS 的 `onmessage` 再 close，否则旧连接的迟到消息会和新一轮 id 撞车。
 20. **404 是终止态，分片没有续传价值**：`task.ps1` 在 exit 6 时会顺手删掉本任务的 `.part`/`.prog`，避免输出目录里堆一堆 0 字节文件。需要保留现场时看 `logs/seg/<id>.seg<n>.log`。
 21. **Win11 任务栏闪红**：只给窗口加 `WS_EX_TOOLWINDOW` 不够——离屏窗口仍可能被算进 Edge 分组，网页弹 alert/通知时任务栏图标会一直闪“请求注意”，点它（窗口在屏幕外）也消不掉。`hide_window.ps1` 现在同时做：`ShowWindow(SW_HIDE)` 整窗隐藏 + `ITaskbarList::DeleteTab` 删任务栏按钮 + `FlashWindow(FALSE)` 停闪；Edge 启动参数加 `--disable-notifications` 并关掉后台节流；CDP 侧自动 `Page.handleJavaScriptDialog` 接收弹窗；`server.mjs` 每 2 分钟重新隐藏一次（用户点任务栏把窗口叫回来也能收回去）。隐藏后 `document.visibilityState=hidden`，但 CDP 求值和定时器实测正常（1s 定时器 ~1.0s 触发）。
+22. **常驻浏览器“进程活但网络死”会让任务永久卡在 resolving**（实测）：Edge 页面偶尔会进入“同步 JS 正常（`1+1`/`document.title` 秒回）、但页面内任何 `fetch` 全部挂起不返回”的状态（连 example.com 都挂，而同机 .NET 走同一代理秒回，说明是那个标签页自己的网络栈卡死）。ITS 所有 API 调用都是页面内 `fetch`，`Runtime.evaluate(awaitPromise:true)` 会一直等到 90s CDP 超时 → `CDP 超时: Runtime.evaluate`。旧的自愈逻辑有两个叠加缺陷使其永不恢复：① `_probe()` 只跑同步 `1+1`，探不到网络死；② 失败只 `browser=null`，`Browser.start` 一 ping 通 9333 端口就 `reused` 回同一个病态进程（`reused=true` 也不会被杀）。**根治**：页面内 `fetch` 加 `AbortController` 硬超时（`apiFetchTimeoutMs`，默认 30s，挂起即返回 `status:0`）；`apiFetch`/`doLogin` 一旦 `status:0` 或 CDP 异常就 `hardRestartBrowser()`——按 CDP 端口 `netstat` 反查主进程 PID 再 `taskkill /T /F` 杀整个进程树（只杀我们这个 `--user-data-dir` 实例，不碰用户其它 Edge 窗口），下次 `getBrowser` 自然起干净实例。重启后靠 profile 里的 CF clearance 快速过盾。若新实例仍全部 fetch 挂 → 是代理（127.0.0.1:7897）对浏览器流量黑洞，切换/重启代理节点即可。
+23. **同步 `spawnSync` 会冻结整个 Node 事件循环 → 面板/SSE 假死**（实测）：`browser.mjs` 的 `hideTaskbar()`（每 2 分钟 re-hide + 每次重连都调）和 `killInstance()` 原先都用 `spawnSync` 跑 PowerShell/netstat。`spawnSync` 是同步的，会把 ITS 整个事件循环堵死到子进程返回（上限 10s）；机器一忙（ffmpeg 压缩 + 8 段下载打满 CPU/磁盘）PowerShell 冷启动能被拖好几秒，期间 `/api/state`、SSE 全不响应 → “前端整个卡住”。**根治**：这两处改成异步 `spawn`（fire-and-forget），`killInstance` 返回 Promise、`hardRestartBrowser` 里 `await`；re-hide 定时器在“有任务在跑/正在重启通道”时跳过；`pollProgress`（每秒）里的僵死回收 `killTree` 也换成非阻塞 `killTreeAsync`（用户主动的停止/移除/重试/退出仍用同步 `killTree`，保证退出前确实杀干净）。（压缩器侧也有同型 bug，见其仓库：`/api/handoff` 的 `enqueue`/`snapshot` 直接在事件循环里做持锁的同步磁盘写 `_save`，磁盘饱和时冻死 FastAPI；ITS→压缩器的调用全是带硬超时的异步 fetch，所以压缩器卡死不会直接死锁 ITS 事件循环，只会让 ITS 显示“压缩器离线/pending”。）
 
 ## 7. 常见任务配方
 

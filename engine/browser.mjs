@@ -13,7 +13,7 @@
 //
 //  零 npm 依赖：Node 24 自带全局 WebSocket，直接说 CDP。
 // =============================================================================
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,6 +92,35 @@ export class Browser {
     } catch { return false; }
   }
 
+  /** 按 CDP 端口反查我们那个常驻浏览器的主进程，连进程树一起杀掉，逼下次 start() 起一个干净的。
+   *  为什么需要：reused=true 时本会话没有 child 句柄（进程不是我们 spawn 的），软重连只是换个 WS
+   *  重新贴到同一个「网络栈已死但端口还能 ping 通」的病态实例上，永远恢复不了。
+   *  taskkill /T /F 只杀这个 --user-data-dir 实例的进程树，不碰用户自己开的其它 Edge 窗口。
+   *  ⚠ 用异步 spawn，绝不用 spawnSync：同步调用会卡住整个 Node 事件循环 → 面板/SSE 假死。 */
+  static killInstance(port) {
+    return new Promise((resolve) => {
+      let out = ''; let done = false; let killer = null;
+      const finish = (v) => { if (done) return; done = true; if (killer) clearTimeout(killer); resolve(v); };
+      let p;
+      try { p = spawn('netstat', ['-ano', '-p', 'TCP'], { windowsHide: true }); }
+      catch { return finish(0); }
+      killer = setTimeout(() => { try { p.kill(); } catch { /* 忽略 */ } finish(0); }, 8000);
+      p.stdout.on('data', (d) => { out += d; });
+      p.on('error', () => finish(0));
+      p.on('close', () => {
+        if (done) return;
+        const m = out.match(new RegExp(`:${port}\\s+\\S+\\s+LISTENING\\s+(\\d+)`, 'i'));
+        const pid = m ? Number(m[1]) : 0;
+        if (pid <= 0) return finish(0);
+        try {
+          const k = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true });
+          k.on('error', () => finish(pid));
+          k.on('close', () => finish(pid));
+        } catch { finish(pid); }
+      });
+    });
+  }
+
   async _connect(startUrl) {
     // 先摘掉旧 WS 的处理器再关：否则旧连接的迟到消息会和新一轮的 id 撞车
     if (this.ws) {
@@ -125,6 +154,8 @@ export class Browser {
     };
     await this._send('Runtime.enable', {}, 10000);
     await this._send('Page.enable', {}, 10000);
+    // 如果重连前页面就已经弹着 alert/confirm，事件不会再补发；主动关一次，否则每次 evaluate 都会卡死
+    try { await this._send('Page.handleJavaScriptDialog', { accept: true }, 3000); } catch { /* 没有弹窗 */ }
     if (!/iwara\.tv/.test(page.url || '')) {
       await this._send('Page.navigate', { url: startUrl }, 15000);
     }
@@ -142,7 +173,14 @@ export class Browser {
   }
 
   async evalJs(expression, { awaitPromise = true, timeoutMs = 90000 } = {}) {
-    const r = await this._send('Runtime.evaluate', { expression, awaitPromise, returnByValue: true }, timeoutMs);
+    let r;
+    try {
+      r = await this._send('Runtime.evaluate', { expression, awaitPromise, returnByValue: true }, timeoutMs);
+    } catch (e) {
+      // 页面里可能有 alert/confirm 阻塞了 JS：先关掉弹窗再重试一次
+      try { await this._send('Page.handleJavaScriptDialog', { accept: true }, 3000); } catch { /* 没有弹窗 */ }
+      r = await this._send('Runtime.evaluate', { expression, awaitPromise, returnByValue: true }, timeoutMs);
+    }
     if (r.exceptionDetails) throw new Error('页面内异常: ' + (r.exceptionDetails.exception?.description || r.exceptionDetails.text));
     return r.result?.value;
   }
@@ -161,7 +199,7 @@ export class Browser {
 
   /** 在页面里发 API 请求：自动补 X-Version / X-Site / Authorization；返回 {status, json, text}
    *  _probe() 活体检测：WebSocket/CDP 断了就自动重开 */
-  async apiFetch(method, urlOrPath, { body, token } = {}) {
+  async apiFetch(method, urlOrPath, { body, token, timeoutMs = 30000 } = {}) {
     // 每次调前探一下 CDP（API 请求间隔大，探针开销可忽略）
     if (await this._probe()) {
       await this._connect('about:blank');
@@ -170,19 +208,24 @@ export class Browser {
     }
     const full = /^https?:/i.test(urlOrPath) ? urlOrPath : `https://api.iwara.tv${urlOrPath}`;
     const xv = await xVersion(full);
-    const payload = JSON.stringify({ method, url: full, xv, body: body ?? null, token: token ?? '' });
+    const payload = JSON.stringify({ method, url: full, xv, body: body ?? null, token: token ?? '', tmo: timeoutMs });
+    // 页面内 fetch 自带硬超时：请求挂起会在 tmo 毫秒内 abort 返回 status:0，
+    // 不再让 Runtime.evaluate(awaitPromise) 干等到 90s CDP 超时——这是历史「任务卡在 resolving」的根因
     const expr = `(async () => {
       const o = ${payload};
       const h = { Accept: 'application/json', 'X-Site': 'www.iwara.tv', 'X-Version': o.xv };
       if (o.token) h.Authorization = 'Bearer ' + o.token;
       if (o.body != null) h['Content-Type'] = 'application/json';
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), o.tmo);
       try {
-        const r = await fetch(o.url, { method: o.method, headers: h, body: o.body != null ? JSON.stringify(o.body) : undefined, credentials: 'include' });
+        const r = await fetch(o.url, { method: o.method, headers: h, body: o.body != null ? JSON.stringify(o.body) : undefined, credentials: 'include', signal: ctrl.signal });
         const t = await r.text();
         return JSON.stringify({ status: r.status, text: t.slice(0, 400000) });
-      } catch (e) { return JSON.stringify({ status: 0, text: '', error: String(e) }); }
+      } catch (e) { return JSON.stringify({ status: 0, text: '', error: (e && e.name === 'AbortError') ? ('timeout>' + o.tmo + 'ms') : String(e) }); }
+      finally { clearTimeout(timer); }
     })()`;
-    const raw = await this.evalJs(expr);
+    const raw = await this.evalJs(expr, { timeoutMs: timeoutMs + 5000 });
     const out = JSON.parse(raw || '{"status":0,"text":""}');
     try { out.json = JSON.parse(out.text); } catch { out.json = null; }
     return out;
@@ -269,17 +312,22 @@ export class Browser {
   }
 
   /** 把 CDP 的 Edge 窗口从任务栏摘掉（WS_EX_TOOLWINDOW + SetParent 强制刷新）
-   *  ⚠️ 这里曾经写成 require('child_process')：ESM 里 require 未定义 → 每次都抛
-   *  ReferenceError，被上层 try/catch 吞掉 → 窗口其实从没藏住。必须用顶部 import 的 spawnSync。 */
+   *  ⚠️ 绝不能用 spawnSync：那是同步调用，会把整个 Node 事件循环堵死到 PowerShell 跑完为止（上限 10s）。
+   *  机器一忙（压缩+下载打满 CPU）就表现为「面板/SSE 整个假死」。改成异步 spawn，fire-and-forget。 */
   async hideTaskbar() {
-    const ps = 'powershell.exe';
-    const script = path.join(ROOT, 'engine', 'hide_window.ps1');
-    const r = spawnSync(ps, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Port', String(this.port), '-Action', 'hide'], {
-      timeout: 10000, windowsHide: true, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024,
-    });
-    if (r.error || !String(r.stdout || '').includes('window(s)')) {
-      console.warn(`[hide] 失败了 exit=${r.status} out="${String(r.stdout || '').trim()}" err="${String(r.stderr || '').trim()}"`);
-    }
+    try {
+      const script = path.join(ROOT, 'engine', 'hide_window.ps1');
+      const p = spawn('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Port', String(this.port), '-Action', 'hide'], { windowsHide: true });
+      let out = ''; let err = ''; let failed = false;
+      p.stdout.on('data', (d) => { out += d; });
+      p.stderr.on('data', (d) => { err += d; });
+      p.on('error', () => { failed = true; });
+      const killer = setTimeout(() => { try { p.kill(); } catch { /* 忽略 */ } }, 10000);
+      p.on('close', (code) => {
+        clearTimeout(killer);
+        if (failed || !out.includes('window(s)')) console.warn(`[hide] 失败了 exit=${code} out="${out.trim()}" err="${err.trim()}"`);
+      });
+    } catch { /* 忽略 */ }
   }
 
   /** 活体探测：CDP WebSocket/JSON 全部超时就说明断了，返回 true。

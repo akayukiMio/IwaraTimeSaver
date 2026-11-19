@@ -40,6 +40,7 @@ const OPEN_BROWSER = process.argv.includes('--open');
 const EXTRA_HOSTS = String(process.env.IWARA_WEB_HOSTS || '').split(',').map((s) => s.trim()).filter(Boolean);
 const STALE_SEC = Math.max(30, Number(CFG.staleProgressSec) || 180);   // 进度文件多久没更新算僵死
 const LOG_MAX = Math.max(1, Number(CFG.logMaxMb) || 8) * 1024 * 1024; // 单个日志文件上限
+const API_FETCH_TIMEOUT_MS = Math.max(5000, Number(CFG.apiFetchTimeoutMs) || 30000); // 页面内 fetch 硬超时
 const COMPRESSOR_URL = String(CFG.compressorUrl || 'http://127.0.0.1:8765').replace(/\/+$/, '');
 const COMPRESSOR_DIR = String(CFG.compressorDir || path.resolve(ROOT, '..', 'video_compressor'));
 const AUTO_HANDOFF = CFG.autoHandoff !== false;
@@ -54,6 +55,7 @@ try { fs.rmSync(STOPFLAG, { force: true }); } catch { /* 忽略 */ }
 const tasks = new Map();          // id -> task
 let browser = null;
 let browserStarting = null;
+let browserRestart = null;   // 单飞：并发失败只强制重启一次浏览器通道
 let token = null;
 let loginPromise = null;
 let LISTEN_PORT = PORT;
@@ -140,6 +142,18 @@ function killTree(pid) {
   try { spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, timeout: 8000 }); } catch { /* 已退出 */ }
 }
 
+// 非阻塞版：用于 pollProgress 这类“每秒定时器”路径——taskkill 的 spawnSync 会卡住整个 Node 事件循环。
+// （用户主动的 停止/移除/重试/退出 仍走同步 killTree，确保返回前进程树确实被回收。）
+function killTreeAsync(pid) {
+  if (!pid) return;
+  try {
+    const p = spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true });
+    p.on('error', () => { /* 已退出 */ });
+    const killer = setTimeout(() => { try { p.kill(); } catch { /* 忽略 */ } }, 8000);
+    p.on('close', () => clearTimeout(killer));
+  } catch { /* 已退出 */ }
+}
+
 // 上次异常退出留下的 task.ps1（持锁）必须在调度前清掉，否则新任务会和旧孤儿抢 .part。
 // 杀之前先确认 pid 真的还是 powershell.exe：pid 可能已被无关进程复用。
 function procName(pid) {
@@ -208,6 +222,23 @@ async function getBrowser() {
   return browserStarting;
 }
 
+/** 强制重启浏览器通道：杀掉卡死的 Edge 进程树 + 清登录态，逼下次 getBrowser 起一个干净实例。
+ *  历史「任务永久停在 resolving」的根因：软重连（browser=null）只换个句柄，ping 通 CDP 端口就
+ *  reused 回同一个网络栈已死的进程，永远恢复不了。单飞合并并发请求，避免下载/多任务互相把浏览器杀来杀去。 */
+function hardRestartBrowser(reason) {
+  if (browserRestart) return browserRestart;
+  browserRestart = (async () => {
+    log('system', `强制重启浏览器通道（${reason}）`);
+    const dead = browser;
+    browser = null; browserStarting = null; token = null;
+    setAuth('starting', '重启浏览器通道');
+    if (dead) { try { await dead.stop(); } catch { /* 忽略 */ } }
+    try { const pid = await Browser.killInstance(CFG.cdpPort || 9333); if (pid) log('system', `回收卡死浏览器进程树 pid=${pid}`); } catch { /* 忽略 */ }
+    await sleep(1500);
+  })().finally(() => { browserRestart = null; });
+  return browserRestart;
+}
+
 async function applyLogin(r) {
   token = r.accessToken;
   writeTokens(r.accessToken, r.refreshToken, r.via);
@@ -245,10 +276,7 @@ async function doLogin() {
     } catch (e) {
       lastErr = e;
       log('system', `登录失败（第 ${attempt + 1}/2）：${e.message}`);
-      const dead = browser;
-      browser = null;
-      if (dead && !dead.reused) { try { await dead.stop(); } catch { /* 忽略 */ } }
-      if (attempt === 0) await sleep(1500);
+      await hardRestartBrowser('登录失败');   // 软重连换不掉卡死进程，直接强制重启通道
     }
   }
   setAuth('error', lastErr?.message || '登录失败');
@@ -268,7 +296,7 @@ async function apiFetch(method, urlOrPath, opts = {}) {
     try {
       const b = await getBrowser();
       const t = await ensureLogin();
-      const r = await b.apiFetch(method, urlOrPath, { ...opts, token: t });
+      const r = await b.apiFetch(method, urlOrPath, { ...opts, token: t, timeoutMs: API_FETCH_TIMEOUT_MS });
       if (r.status === 401 && attempt === 0) {
         // 令牌被吊销/过期：清掉重登一次（403 多数是 CF 挑战，重登没用）
         log('system', '令牌被拒（401），重新获取后重试');
@@ -276,13 +304,19 @@ async function apiFetch(method, urlOrPath, opts = {}) {
         setAuth('token', '令牌被拒，重新获取');
         continue;
       }
+      if (r.status === 0 && attempt === 0) {
+        // 页面内 fetch 被硬超时打断 / 请求没到 API：多半是该标签页网络栈卡死，
+        // 软重连（只换句柄不换进程）无效 → 强制重启浏览器后重试一次
+        log('system', `API 请求无响应（${r.error || 'timeout'}），强制重启浏览器通道后重试`);
+        await hardRestartBrowser('页面网络无响应');
+        continue;
+      }
       return r;
     } catch (e) {
-      // CDP 通道卡死/断线：丢掉句柄重连一次（Edge 还在的话 Browser.start 会复用）
+      // CDP 通道卡死/断线：强制重启整个浏览器进程树（复用卡死实例是「任务永久 resolving」的根因）
       lastErr = e;
       log('system', `API 通道异常（第 ${attempt + 1} 次）：${e.message}`);
-      browser = null;
-      await sleep(800);
+      await hardRestartBrowser('CDP 调用异常');
     }
   }
   throw lastErr || new Error('API 通道不可用');
@@ -364,8 +398,9 @@ async function syncPipeline() {
       const x = byId.get(t.id);
       if (!x) continue;
       const first = Array.isArray(x.result) && x.result[0] ? x.result[0] : null;
+      const paused = !!j.is_paused && x.state === 'running';
       const next = {
-        state: x.state === 'running' ? 'compressing' : x.state,
+        state: paused ? 'paused' : (x.state === 'running' ? 'compressing' : x.state),
         position: x.position || 0,
         output: first ? (first.archive_path || first.output_path || '') : '',
         saved: first && first.status === 'done' ? Math.max(0, (first.size || 0) - (first.output_size || 0)) : 0,
@@ -468,7 +503,7 @@ function pollProgress() {
     // task.ps1 每 700ms 写一次 updatedAt；这么久没动静说明进程卡死或已变成孤儿
     const idle = now - (t.progressTs || t.startedTs || now);
     if (idle > STALE_SEC * 1000) {
-      killTree(t.childProc.pid);
+      killTreeAsync(t.childProc.pid);   // 非阻塞：僵死批量回收时不堵事件循环（杀完置 failed，不会立刻重跑）
       t.childProc = null;
       t.status = 'failed';
       t.error = `进度 ${Math.round(idle / 1000)}s 未更新（进程无响应），已回收`;
@@ -828,9 +863,11 @@ if (AUTO_HANDOFF) {
   setInterval(syncPipeline, 5000).unref();
   setInterval(retryHandoffs, 30000).unref();
 }
-// 定时重新隐藏：用户点任务栏把窗口叫回来、或 Edge 新开窗口时，2 分钟内收回去并清掉“请求注意”闪烁
+// 定时重新隐藏：用户点任务栏把窗口叫回来、或 Edge 新开窗口时，2 分钟内收回去并清掉“请求注意”闪烁。
+// 忙（有任务在解析/下载，或正在重启通道）时跳过：hideTaskbar 已非阻塞，但省掉高压期多起一个 PowerShell 的开销。
 setInterval(() => {
-  if (!browser) return;
+  if (!browser || browserRestart) return;
+  for (const t of tasks.values()) if (t.status === 'resolving' || t.status === 'downloading') return;
   try { browser.hideTaskbar().catch(() => {}); } catch { /* 忽略 */ }
 }, 120000).unref();
 

@@ -12,6 +12,7 @@
   "warmBrowserOnStart": true,
   "formLoginFallback": false,
   "staleProgressSec": 180,
+  "apiFetchTimeoutMs": 30000,
   "logMaxMb": 8,
   "compressorUrl": "http://127.0.0.1:8765",
   "compressorDir": "video_compressor 的绝对路径",
